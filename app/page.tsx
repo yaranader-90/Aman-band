@@ -1,0 +1,1544 @@
+"use client";
+
+import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { createClient } from "@/lib/supabase/client";
+
+type Role = "patient" | "doctor" | "guardian";
+type Lang = "en" | "ar";
+type Theme = "light" | "dark";
+type Screen = "welcome" | "role" | "auth" | "recovery" | "dashboard";
+type PatientStatus = "active" | "completed";
+type Medication = { id: string; name: string; dose: string; time: string; status: "Due" | "Taken" | "Skipped"; frequency?: string; scheduleTimes?: string[]; startDate?: string; endDate?: string };
+type Patient = {
+  id: string;
+  name: string;
+  nationalId: string;
+  birthDate: string;
+  phone: string;
+  diagnosis: string;
+  status: PatientStatus;
+  bandMode: "optional" | "prescribed";
+  bandStatus: "active" | "returned" | "not-issued";
+  doctorId?: string;
+  guardians: { name: string; phone: string; relationship: string; accountId?: string }[];
+  vitals: { heartRate: number; spo2: number; temperature: number; activity: number };
+  medications: Medication[];
+  instructions: string;
+  symptoms: { text: string; date: string; source: string }[];
+  messages: { from: string; to?: string; text: string; date: string }[];
+  alerts: { level: "green" | "yellow" | "red"; text: string; date: string }[];
+  audit?: string[];
+  followUp?: string;
+};
+type Account = {
+  id: string;
+  role: Role;
+  name: string;
+  contact: string;
+  password: string;
+  patientId?: string;
+  nationalId?: string;
+  birthDate?: string;
+  relationship?: string;
+  title?: string;
+  specialty?: string;
+  professionalId?: string;
+  avatarData?: string;
+};
+type AppState = { patients: Patient[]; accounts: Account[] };
+
+type InstallPromptEvent = Event & {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
+};
+
+const STORAGE_KEY = "aman-band-prototype-v1";
+const CURRENT_KEY = "aman-band-current-user-v1";
+const SETTINGS_KEY = "aman-band-settings-v1";
+
+const words: Record<string, [string, string]> = {
+  welcome: ["Welcome to", "مرحبًا بك في"],
+  tagline: ["Looking for you, all the time.", "نطمئن عليك، في كل وقت."],
+  welcomeBody: ["Safer recovery. Connected families. Smarter healthcare.", "تعافٍ أكثر أمانًا، وأسرة مترابطة، ورعاية صحية أذكى."],
+  getStarted: ["Get started", "ابدأ الآن"],
+  roleTitle: ["How will you use AMAN?", "كيف ستستخدم أمان؟"],
+  roleSubtitle: ["Choose the experience that fits you.", "اختر الواجهة المناسبة لك."],
+  patient: ["Patient", "المريض"],
+  doctor: ["Doctor", "الطبيب"],
+  guardian: ["Parent / Caregiver", "ولي أمر / متابع الحالة"],
+  patientSub: ["Follow your recovery and care plan", "تابع تعافيك وخطتك العلاجية"],
+  doctorSub: ["Manage patients and care plans", "إدارة المرضى والخطط العلاجية"],
+  guardianSub: ["Stay connected with your loved one", "ابقَ على تواصل مع من ترعى"],
+  signIn: ["Sign in", "تسجيل الدخول"],
+  createAccount: ["Create account", "إنشاء حساب"],
+  signInIntro: ["Welcome back to connected care.", "مرحبًا بعودتك إلى الرعاية المتصلة."],
+  createIntro: ["Let’s set up your AMAN account.", "لنُنشئ حسابك في أمان."],
+  fullName: ["Full name", "الاسم الكامل"],
+  mobileEmail: ["Mobile number or email", "رقم الجوال أو البريد الإلكتروني"],
+  password: ["Password", "كلمة المرور"],
+  nationalId: ["National ID / Iqama", "رقم الهوية / الإقامة"],
+  birthDate: ["Date of birth", "تاريخ الميلاد"],
+  patientId: ["Patient ID", "معرّف المريض"],
+  relationship: ["Relationship to patient", "صلة القرابة بالمريض"],
+  doctorTitle: ["Professional title / rank", "المسمى أو المرتبة المهنية"],
+  specialty: ["Specialty", "التخصص"],
+  hospital: ["Hospital / clinic (optional)", "المستشفى / العيادة (اختياري)"],
+  login: ["Continue securely", "متابعة"],
+  create: ["Create my account", "إنشاء حسابي"],
+  hasAccount: ["Already have an account?", "لديك حساب بالفعل؟"],
+  noAccount: ["New to AMAN?", "أول مرة تستخدم أمان؟"],
+  back: ["Back", "رجوع"],
+  preview: ["Preview demo", "تجربة النسخة التجريبية"],
+  demoNote: ["Prototype only · Demo accounts use simulated data.", "نسخة تجريبية فقط · الحسابات التجريبية تستخدم بيانات افتراضية."],
+  language: ["Language", "اللغة"],
+  english: ["English", "الإنجليزية"],
+  arabic: ["العربية", "العربية"],
+  display: ["Display", "المظهر"],
+  light: ["Light", "فاتح"],
+  dark: ["Dark", "داكن"],
+  overview: ["Overview", "نظرة عامة"],
+  myHealth: ["My health", "صحتي"],
+  patients: ["Patients", "المرضى"],
+  monitoring: ["Monitoring", "المتابعة الصحية"],
+  carePlan: ["Care plan", "الخطة العلاجية"],
+  medication: ["Medication", "الأدوية"],
+  alerts: ["Alerts", "التنبيهات"],
+  messages: ["Messages", "التواصل"],
+  settings: ["Settings", "الإعدادات"],
+  signOut: ["Sign out", "تسجيل الخروج"],
+  demo: ["Prototype · Simulated data", "نموذج أولي · بيانات تجريبية"],
+  hello: ["Good to see you", "سعداء بعودتك"],
+  welcomeDashboard: ["Here is your care overview for today.", "إليك ملخص الرعاية لهذا اليوم."],
+  enrolled: ["Enrolled patients", "المرضى المسجلون"],
+  stable: ["No active alerts", "دون تنبيهات نشطة"],
+  review: ["Needs review", "بحاجة للمراجعة"],
+  urgent: ["Urgent alerts", "تنبيهات عاجلة"],
+  searchPatients: ["Search by name or patient ID", "ابحث بالاسم أو معرّف المريض"],
+  addPatient: ["Add patient", "إضافة مريض"],
+  linkPatient: ["Link existing patient by ID", "ربط مريض موجود عبر المعرّف"],
+  createPatient: ["Create patient record", "إنشاء ملف مريض"],
+  add: ["Add", "إضافة"],
+  save: ["Save changes", "حفظ التغييرات"],
+  cancel: ["Cancel", "إلغاء"],
+  edit: ["Edit", "تعديل"],
+  remove: ["Remove", "إزالة"],
+  endCare: ["End care / return band", "إنهاء الرعاية / استرجاع السوار"],
+  active: ["Active", "نشط"],
+  completed: ["Completed", "منتهية"],
+  band: ["AMAN Band", "سوار أمان"],
+  optional: ["Optional", "اختياري"],
+  prescribed: ["Prescribed in care plan", "موصوف ضمن الخطة العلاجية"],
+  bandActive: ["Assigned", "مُخصّص للمريض"],
+  bandReturned: ["Returned", "تم استرجاعه"],
+  bandNotIssued: ["Not issued", "لم يُسلّم"],
+  heartRate: ["Heart rate", "معدل نبض القلب"],
+  oxygen: ["Blood oxygen (SpO₂)", "الأكسجين في الدم (SpO₂)"],
+  temperature: ["Skin temperature trend", "اتجاه حرارة الجلد"],
+  activity: ["Activity", "النشاط"],
+  todayPlan: ["Today’s plan", "خطة اليوم"],
+  medications: ["Medication schedule", "جدول الأدوية"],
+  taken: ["Taken", "تم التناول"],
+  due: ["Due", "مستحق"],
+  skipped: ["Skipped", "تم التخطي"],
+  markTaken: ["Mark as taken", "تأكيد التناول"],
+  markSkipped: ["Mark as skipped", "تسجيل عدم التناول"],
+  symptoms: ["Report a symptom", "الإبلاغ عن عرض"],
+  symptomPlaceholder: ["Describe how you feel…", "صف ما تشعر به…"],
+  sendReport: ["Send report", "إرسال البلاغ"],
+  recentSymptoms: ["Recent symptom reports", "بلاغات الأعراض الأخيرة"],
+  contactTeam: ["Contact the care team", "التواصل مع الفريق الطبي"],
+  messagePlaceholder: ["Write a message…", "اكتب رسالة…"],
+  send: ["Send", "إرسال"],
+  familyContacts: ["Family / caregiver contacts", "جهات اتصال الأسرة / المتابعين"],
+  addFamily: ["Add family contact", "إضافة جهة اتصال من الأسرة"],
+  phone: ["Phone number", "رقم الجوال"],
+  relation: ["Relationship", "صلة القرابة"],
+  emergency: ["Emergency contact", "جهة اتصال للطوارئ"],
+  contactPermission: ["Patient consent and role permissions control what family can see.", "تخضع المعلومات التي تظهر للأسرة لموافقة المريض وصلاحيات الحساب."],
+  doctorProfile: ["Doctor profile", "ملف الطبيب"],
+  doctorName: ["Doctor name", "اسم الطبيب"],
+  title: ["Title / rank", "المسمى / المرتبة"],
+  noPatients: ["No patients found yet.", "لا يوجد مرضى حتى الآن."],
+  patientProfile: ["Patient profile", "ملف المريض"],
+  diagnosis: ["Diagnosis / care reason", "التشخيص / سبب الرعاية"],
+  bandMode: ["Band assignment", "طريقة تخصيص السوار"],
+  bandStatus: ["Band status", "حالة السوار"],
+  careStatus: ["Care status", "حالة الرعاية"],
+  instructions: ["Care instructions", "تعليمات الرعاية"],
+  allPatients: ["All patients", "كل المرضى"],
+  profile: ["Profile", "الملف الشخصي"],
+  familyView: ["Family view", "واجهة الأسرة"],
+  linkedPatient: ["Linked patient", "المريض المرتبط"],
+  noLinkedPatient: ["No patient is linked to this account.", "لا يوجد مريض مرتبط بهذا الحساب."],
+  updateContact: ["Update contact", "تحديث بيانات التواصل"],
+  fullConsent: ["I confirm the patient has authorized this account to view permitted health updates.", "أؤكد أن المريض وافق على أن يطّلع هذا الحساب على التحديثات الصحية المسموح بها."],
+  demoWarning: ["Demo readings are simulated and are not medical advice or real device measurements.", "القراءات تجريبية وليست قياسات فعلية من جهاز أو نصيحة طبية."],
+  dataPolicy: ["End care and data retention", "إنهاء الرعاية والاحتفاظ بالبيانات"],
+  dataPolicyBody: ["Ending care returns the band to inventory. Medical records should be retained or deleted only under the approved retention policy; this prototype does not connect to a clinical record system.", "إنهاء الرعاية يعيد السوار للمخزون. تُحتفظ السجلات الصحية أو تُحذف وفق سياسة الاحتفاظ المعتمدة؛ هذه النسخة لا تتصل بنظام سجلات طبية فعلي."],
+  confirmEnd: ["End this care episode? The patient will be marked completed and the band returned.", "هل تريد إنهاء فترة الرعاية؟ ستُعلّم الحالة بأنها منتهية وسيُسجل السوار كمُسترجع."],
+  languageDisplay: ["Language & display", "اللغة والمظهر"],
+  chooseLanguage: ["Choose language", "اختر اللغة"],
+  chooseTheme: ["Choose display", "اختر المظهر"],
+  profileSettings: ["Account details", "بيانات الحساب"],
+  updateSettings: ["Changes apply across the app.", "تُطبق التغييرات على جميع صفحات التطبيق."],
+  successPatient: ["Patient linked successfully.", "تم ربط المريض بنجاح."],
+  patientNotFound: ["No patient was found with that ID.", "لم يتم العثور على مريض بهذا المعرّف."],
+  required: ["Please complete the required fields.", "يرجى تعبئة الحقول المطلوبة."],
+  accountNotFound: ["We couldn’t find that account. Create an account or preview the demo.", "لم نعثر على هذا الحساب. أنشئ حسابًا أو جرّب النسخة التجريبية."],
+  idExists: ["An account or patient with this ID already exists.", "يوجد حساب أو مريض بهذا المعرّف بالفعل."],
+  guardianPatientRequired: ["A matching patient ID is required to create a caregiver account.", "يلزم إدخال معرّف مريض موجود لإنشاء حساب المتابع."],
+  loginHint: ["Use the same contact and password entered during sign-up.", "استخدم بيانات التواصل وكلمة المرور التي أدخلتها عند إنشاء الحساب."],
+  demoLogin: ["Quick demo access", "دخول سريع للتجربة"],
+  doctorDemo: ["Open doctor view", "فتح واجهة الطبيب"],
+  patientDemo: ["Open patient view", "فتح واجهة المريض"],
+  guardianDemo: ["Open family view", "فتح واجهة الأسرة"],
+  noMessages: ["No messages yet. Start the conversation here.", "لا توجد رسائل بعد. ابدأ المحادثة من هنا."],
+  recentAlerts: ["Recent alerts", "التنبيهات الأخيرة"],
+  sleep: ["Sleep summary", "ملخص النوم"],
+  dailyActivity: ["Daily activity", "النشاط اليومي"],
+  viewProfile: ["Open profile", "فتح الملف"],
+  careEnded: ["Care episode completed", "انتهت فترة الرعاية"],
+  saveProfile: ["Save profile", "حفظ الملف"],
+  notes: ["Communication history & notes", "سجل التواصل والملاحظات"],
+};
+
+function tr(key: string, lang: Lang) {
+  const item = words[key];
+  return item ? item[lang === "ar" ? 1 : 0] : key;
+}
+
+function makeInitialData(): AppState {
+  const patient: Patient = {
+    id: "AMAN-248631",
+    name: "Sara Ahmed",
+    nationalId: "0000000000",
+    birthDate: "1958-05-17",
+    phone: "+966 5X XXX XXXX",
+    diagnosis: "Post-discharge recovery (demo)",
+    status: "active",
+    bandMode: "prescribed",
+    bandStatus: "active",
+    doctorId: "doctor-demo",
+    guardians: [{ name: "Mona Ahmed", phone: "+966 5X XXX XXXX", relationship: "Daughter", accountId: "guardian-demo" }],
+    vitals: { heartRate: 84, spo2: 96, temperature: 36.6, activity: 62 },
+    medications: [
+      { id: "med-1", name: "Medication A", dose: "As prescribed", time: "08:00 AM", status: "Taken" },
+      { id: "med-2", name: "Medication B", dose: "As prescribed", time: "02:00 PM", status: "Due" },
+      { id: "med-3", name: "Medication C", dose: "As prescribed", time: "08:00 PM", status: "Due" },
+    ],
+    instructions: "Take medications as prescribed, stay hydrated, and report any new or worsening symptoms to your care team.",
+    symptoms: [{ text: "Feeling a little tired today.", date: "Today · 09:20 AM", source: "Patient" }],
+    messages: [{ from: "Care team", text: "Good morning. Please confirm that you are comfortable and have followed your morning plan.", date: "Today · 08:30 AM" }],
+    alerts: [{ level: "yellow", text: "Medication confirmation needed this afternoon.", date: "Today · 08:35 AM" }],
+    audit: ["Care plan created · Demo doctor · Today", "Morning medication marked as taken · Patient · Today"],
+    followUp: "",
+  };
+  const accounts: Account[] = [
+    { id: "doctor-demo", role: "doctor", name: "Dr. Richard Morgan", title: "Consultant Physician", specialty: "Internal Medicine", contact: "doctor@aman.demo", password: "demo123" },
+    { id: "patient-demo", role: "patient", name: patient.name, contact: "patient@aman.demo", password: "demo123", patientId: patient.id, nationalId: patient.nationalId, birthDate: patient.birthDate },
+    { id: "guardian-demo", role: "guardian", name: "Mona Ahmed", contact: "family@aman.demo", password: "demo123", patientId: patient.id, relationship: "Daughter" },
+  ];
+  return { patients: [patient], accounts };
+}
+
+function createId() {
+  return `AMAN-${Math.floor(100000 + Math.random() * 900000)}`;
+}
+
+function Icon({ name }: { name: string }) {
+  const paths: Record<string, string> = {
+    grid: "M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z",
+    heart: "M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1.1L12 21l7.8-7.5 1.1-1.1a5.5 5.5 0 0 0-.1-7.8Z",
+    users: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M22 21v-2a4 4 0 0 0-3-3.87 M16 3.13a4 4 0 0 1 0 7.75",
+    bell: "M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9 M10 21h4",
+    message: "M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8z",
+    settings: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8 M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-1.8 3.1-.2-.1a1.7 1.7 0 0 0-1.8.1l-.2.1h-3.6l-.1-.2a1.7 1.7 0 0 0-1.7-.8l-.2.1-3.1-1.8.1-.2a1.7 1.7 0 0 0-.1-1.8L7 15.3v-3.6l.2-.1a1.7 1.7 0 0 0 .8-1.7l-.1-.2 1.8-3.1.2.1a1.7 1.7 0 0 0 1.8-.1l.2-.1h3.6l.1.2a1.7 1.7 0 0 0 1.7.8l.2-.1 3.1 1.8-.1.2a1.7 1.7 0 0 0 .1 1.8l.1.2v3.6z",
+    watch: "M8 2h8 M8 22h8 M6 5h12v14H6z M9 9h6v6H9z",
+    sun: "M12 3v2 M12 19v2 M3 12h2 M19 12h2 M5.6 5.6 7 7 M17 17l1.4 1.4 M18.4 5.6 17 7 M7 17l-1.4 1.4 M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0Z",
+    moon: "M20.9 13A8.5 8.5 0 0 1 11 3.1 8.5 8.5 0 1 0 20.9 13Z",
+    arrow: "M5 12h14 M13 6l6 6-6 6",
+    plus: "M12 5v14 M5 12h14",
+    search: "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16 M21 21l-4.3-4.3",
+    shield: "M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11Z M9 12l2 2 4-4",
+    back: "M19 12H5 M12 19l-7-7 7-7",
+    activity: "M22 12h-4l-3 9L9 3l-3 9H2",
+    logout: "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4 M16 17l5-5-5-5 M21 12H9",
+    share: "M12 16V3 M7 8l5-5 5 5 M5 13v6a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-6",
+  };
+  return <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={paths[name] || paths.grid} /></svg>;
+}
+
+export default function Home() {
+  const [screen, setScreen] = useState<Screen>("welcome");
+  const [role, setRole] = useState<Role>("patient");
+  const [authMode, setAuthMode] = useState<"login" | "signup">("login");
+  const [lang, setLang] = useState<Lang>("en");
+  const [theme, setTheme] = useState<Theme>("light");
+  const [appData, setAppData] = useState<AppState>(() => makeInitialData());
+  const [current, setCurrent] = useState<Account | null>(null);
+  const [tab, setTab] = useState("overview");
+  const [notice, setNotice] = useState("");
+  const [formError, setFormError] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
+  const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
+  const [isInstalled, setIsInstalled] = useState(false);
+  const [previewMode, setPreviewMode] = useState(false);
+  const [recoveryContact, setRecoveryContact] = useState("");
+  const [recoveryNotice, setRecoveryNotice] = useState("");
+  const [messageRecipient, setMessageRecipient] = useState("Care team");
+  const [editingMedicationId, setEditingMedicationId] = useState<string | null>(null);
+  const [profileDraft, setProfileDraft] = useState({ name: "", contact: "", title: "", specialty: "", professionalId: "" });
+  const [showAddPatient, setShowAddPatient] = useState(false);
+  const [patientFormMode, setPatientFormMode] = useState<"link" | "new">("link");
+  const [linkedPatientId, setLinkedPatientId] = useState("");
+  const [search, setSearch] = useState("");
+  const [selectedPatientId, setSelectedPatientId] = useState("");
+  const [symptomText, setSymptomText] = useState("");
+  const [messageText, setMessageText] = useState("");
+  const [editPatient, setEditPatient] = useState<Patient | null>(null);
+  const [signup, setSignup] = useState({ name: "", contact: "", phone: "", password: "", nationalId: "", birthDate: "", patientId: "", relationship: "", title: "", specialty: "" });
+  const [loginForm, setLoginForm] = useState({ contact: "", password: "" });
+  const [newPatient, setNewPatient] = useState({ name: "", nationalId: "", birthDate: "", phone: "", diagnosis: "", bandMode: "prescribed" as "optional" | "prescribed", bandStatus: "active" as "active" | "not-issued" });
+  const [familyForm, setFamilyForm] = useState({ name: "", phone: "", relationship: "" });
+  const [messageTab, setMessageTab] = useState("all");
+  const [medicationForm, setMedicationForm] = useState({ name: "", dose: "", time: "08:00", secondTime: "14:00", thirdTime: "20:00", frequency: "once", startDate: "", endDate: "" });
+  const [carePlanDraft, setCarePlanDraft] = useState("");
+  const [followUpValue, setFollowUpValue] = useState("");
+  const [manualEmergency, setManualEmergency] = useState<{ patientId: string; patientName: string; createdAt: string; acknowledged: boolean } | null>(null);
+  const [liveEmergency, setLiveEmergency] = useState<{ id: string; patient_id: string; patient_code: string; patient_name: string; message: string; created_at: string; status: string } | null>(null);
+  const [accessRequests, setAccessRequests] = useState<Array<{ id: string; patient_id: string; requester_id: string; requester_role: "doctor" | "guardian"; status: "pending" | "approved" | "rejected"; created_at: string; reviewed_at: string | null }>>([]);
+  const [approvedLinkedPatients, setApprovedLinkedPatients] = useState<Patient[]>([]);
+  const [accessPatientCode, setAccessPatientCode] = useState("");
+  const [accessBusy, setAccessBusy] = useState(false);
+  const [accessLoadError, setAccessLoadError] = useState("");
+  const emergencyAudioRef = useRef<{ context: AudioContext; timer: number } | null>(null);
+
+  async function refreshAccountAccessRequests() {
+    if (!current || previewMode) return;
+    try {
+      const supabase = createClient();
+      const { data: authData, error: authError } = await supabase.auth.getUser();
+      if (authError || !authData.user) {
+        setAccessRequests([]);
+        return;
+      }
+      let query = supabase
+        .from("aman_patient_access_requests")
+        .select("id, patient_id, requester_id, requester_role, status, created_at, reviewed_at")
+        .order("created_at", { ascending: false });
+
+      if (current.role === "patient") {
+        const { data: patientRow, error: patientError } = await supabase
+          .from("aman_patients")
+          .select("id")
+          .eq("user_id", authData.user.id)
+          .maybeSingle();
+        if (patientError) throw patientError;
+        if (!patientRow?.id) {
+          setAccessRequests([]);
+          setAccessLoadError(isAr ? "لم يتم العثور على ملف المريض في قاعدة البيانات." : "No patient record was found for this account.");
+          return;
+        }
+        query = query.eq("patient_id", patientRow.id);
+      } else {
+        query = query.eq("requester_id", authData.user.id);
+      }
+
+      const { data, error } = await query;
+      if (error) throw error;
+      setAccessRequests((data || []) as typeof accessRequests);
+      setAccessLoadError("");
+    } catch (error: any) {
+      console.error("AMAN account access request load failed", error);
+      setAccessLoadError(error?.message || (isAr ? "تعذر تحميل طلبات الربط." : "Could not load account-link requests."));
+    }
+  }
+
+  // Load real patient records granted to this doctor/guardian. Demo records remain untouched.
+  async function refreshApprovedLinkedPatients() {
+    if (!current || previewMode || (current.role !== "doctor" && current.role !== "guardian")) {
+      setApprovedLinkedPatients([]);
+      return;
+    }
+    try {
+      const supabase = createClient();
+      const { data: authData, error: authError } = await supabase.auth.getUser();
+      if (authError || !authData.user) throw authError || new Error("No authenticated user");
+      const { data: requests, error: requestError } = await supabase
+        .from("aman_patient_access_requests")
+        .select("patient_id")
+        .eq("requester_id", authData.user.id)
+        .eq("requester_role", current.role)
+        .eq("status", "approved");
+      if (requestError) throw requestError;
+      const patientIds = [...new Set((requests || []).map((r: { patient_id: string }) => r.patient_id).filter(Boolean))];
+      if (!patientIds.length) { setApprovedLinkedPatients([]); return; }
+      const { data: patientRows, error: patientsError } = await supabase
+        .from("aman_patients")
+        .select("id,user_id,patient_code,date_of_birth")
+        .in("id", patientIds);
+      if (patientsError) throw patientsError;
+      const userIds = [...new Set((patientRows || []).map((r: any) => r.user_id).filter(Boolean))];
+      const { data: profiles, error: profilesError } = await supabase
+        .from("aman_profiles")
+        .select("user_id,full_name,contact_email,relationship")
+        .in("user_id", userIds);
+      if (profilesError) throw profilesError;
+      const profileByUser = new Map((profiles || []).map((row: any) => [row.user_id, row]));
+      const sample = makeInitialData().patients[0];
+      const mapped: Patient[] = (patientRows || []).map((row: any) => {
+        const profile: any = profileByUser.get(row.user_id) || {};
+        const base = sample ? JSON.parse(JSON.stringify(sample)) as Patient : null;
+        return {
+          ...(base || {}),
+          id: row.id,
+          name: profile.full_name || row.patient_code || "AMAN Patient",
+          nationalId: "",
+          birthDate: row.date_of_birth || "",
+          phone: "",
+          diagnosis: "",
+          status: "active",
+          bandMode: "prescribed",
+          bandStatus: "not-issued",
+          doctorId: current.id,
+          guardians: [],
+          vitals: base?.vitals || { heartRate: 76, spo2: 98, temperature: 36.7, activity: 5200 },
+          medications: base?.medications || [],
+          instructions: base?.instructions || "",
+          symptoms: base?.symptoms || [],
+          messages: base?.messages || [],
+          alerts: base?.alerts || [],
+          audit: base?.audit || [],
+          followUp: base?.followUp || "",
+        } as Patient;
+      });
+      setApprovedLinkedPatients(mapped);
+      if (mapped.length && (!selectedPatientId || !mapped.some(p => p.id === selectedPatientId)) && current.role === "doctor") {
+        setSelectedPatientId(mapped[0].id);
+      }
+      if (mapped.length && current.role === "guardian") setSelectedPatientId(mapped[0].id);
+    } catch (error: any) {
+      console.error("AMAN approved patient records could not be loaded", error);
+      setAccessLoadError(error?.message || (isAr ? "تعذر تحميل المرضى المرتبطين." : "Could not load approved patients."));
+    }
+  }
+
+  async function submitAccountAccessRequest(patientCode: string, requesterRole?: "doctor" | "guardian") {
+    const roleToUse = requesterRole || (current?.role === "doctor" || current?.role === "guardian" ? current.role : null);
+    if (!current || !roleToUse || !patientCode.trim()) return;
+    setAccessBusy(true);
+    setAccessLoadError("");
+    try {
+      const supabase = createClient();
+      const { data: authData, error: authError } = await supabase.auth.getUser();
+      if (authError || !authData.user) throw new Error(isAr ? "سجلي الدخول أولًا." : "Please sign in first.");
+      const { data, error } = await supabase.rpc("aman_request_patient_access", {
+        p_patient_code: patientCode.trim(),
+        p_requester_role: roleToUse,
+      });
+      if (error) throw error;
+      await refreshAccountAccessRequests();
+      await refreshApprovedLinkedPatients();
+      const status = (data as { status?: string } | null)?.status || "pending";
+      setNotice(status === "approved"
+        ? (isAr ? "هذا الربط معتمد بالفعل." : "This account is already linked and approved.")
+        : status === "pending"
+          ? (isAr ? "تم إرسال طلب الربط. ينتظر موافقة المريض." : "Link request sent. Waiting for patient approval.")
+          : (isAr ? "تم تسجيل طلب الربط." : "Link request recorded."));
+      setAccessPatientCode("");
+      return true;
+    } catch (error: any) {
+      console.error("AMAN account access request failed", error);
+      const message = error?.message || "";
+      setFormError(message || (isAr ? "تعذر إرسال طلب الربط." : "Could not submit the link request."));
+      setNotice(isAr ? "تعذر إرسال طلب الربط. راجعي رسالة الخطأ في النموذج." : "Could not submit the link request. Check the form error.");
+      return false;
+    } finally {
+      setAccessBusy(false);
+    }
+  }
+
+  async function reviewAccountAccessRequest(requestId: string, decision: "approved" | "rejected") {
+    setAccessBusy(true);
+    try {
+      const supabase = createClient();
+      const { data: authData, error: authError } = await supabase.auth.getUser();
+      if (authError || !authData.user || current?.role !== "patient") throw new Error(isAr ? "يجب تسجيل الدخول بحساب المريض." : "Sign in with the patient account to review requests.");
+      const { error } = await supabase.rpc("aman_review_patient_access_request", {
+        p_request_id: requestId,
+        p_decision: decision,
+      });
+      if (error) throw error;
+      await refreshAccountAccessRequests();
+      await refreshApprovedLinkedPatients();
+      setNotice(decision === "approved"
+        ? (isAr ? "تمت الموافقة على طلب الربط." : "The access request was approved.")
+        : (isAr ? "تم رفض طلب الربط." : "The access request was rejected."));
+    } catch (error: any) {
+      console.error("AMAN access request review failed", error);
+      setNotice(error?.message || (isAr ? "تعذر تحديث طلب الربط." : "Could not update the access request."));
+    } finally {
+      setAccessBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!current || screen !== "dashboard" || previewMode) return;
+    void refreshAccountAccessRequests();
+    void refreshApprovedLinkedPatients();
+    const supabase = createClient();
+    const channel = supabase
+      .channel(`aman-access-requests-${current.id}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "aman_patient_access_requests" }, () => {
+        void refreshAccountAccessRequests();
+        void refreshApprovedLinkedPatients();
+      })
+      .subscribe();
+    return () => { void supabase.removeChannel(channel); };
+  }, [current?.id, current?.role, screen, previewMode]);
+
+  function playEmergencyTone() {
+    if (emergencyAudioRef.current) return;
+    try {
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioContextClass) return;
+      const context = new AudioContextClass();
+      const beep = () => {
+        if (context.state === "closed") return;
+        const oscillator = context.createOscillator();
+        const gain = context.createGain();
+        oscillator.type = "sawtooth";
+        oscillator.frequency.setValueAtTime(880, context.currentTime);
+        oscillator.frequency.setValueAtTime(660, context.currentTime + 0.22);
+        gain.gain.setValueAtTime(0.0001, context.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.22, context.currentTime + 0.03);
+        gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.48);
+        oscillator.connect(gain); gain.connect(context.destination);
+        oscillator.start(); oscillator.stop(context.currentTime + 0.5);
+      };
+      void context.resume().then(() => beep());
+      const timer = window.setInterval(beep, 1200);
+      emergencyAudioRef.current = { context, timer };
+    } catch (error) { console.error("Emergency audio unavailable", error); }
+  }
+
+  function stopEmergencyTone() {
+    if (emergencyAudioRef.current) {
+      window.clearInterval(emergencyAudioRef.current.timer);
+      void emergencyAudioRef.current.context.close();
+      emergencyAudioRef.current = null;
+    }
+  }
+
+  async function sendManualEmergency() {
+    if (!activePatient || !window.confirm(isAr ? "هل تريدين إرسال طلب مساعدة طارئ الآن؟" : "Send an emergency help request now?")) return;
+    const createdAt = new Date().toLocaleString();
+    const localAlert = { patientId: activePatient.id, patientName: activePatient.name, createdAt, acknowledged: false };
+
+    // Demo/preview accounts remain local and are never presented as delivered to a care team.
+    try {
+      const supabase = createClient();
+      const { data: authData, error: authError } = await supabase.auth.getUser();
+      if (authError || !authData.user || current?.role !== "patient") {
+        setManualEmergency(localAlert);
+        setAppData((prev) => ({ ...prev, patients: prev.patients.map((p) => p.id === activePatient.id ? { ...p, alerts: [{ level: "red" as const, text: isAr ? "طلب المريض مساعدة طارئة يدويًا" : "Patient manually requested emergency help", date: createdAt }, ...p.alerts] } : p) }));
+        playEmergencyTone();
+        setNotice(isAr ? "هذا حساب تجريبي؛ تم تسجيل التنبيه على هذا الجهاز فقط ولم يُرسل إلى الطبيب أو العائلة." : "Demo account: this alert is local to this device and was not sent to the doctor or family.");
+        return;
+      }
+
+      // Resolve the authenticated patient's actual UUID. patient_code is a display ID, not the FK.
+      const { data: patientRow, error: patientError } = await supabase
+        .from("aman_patients")
+        .select("id, patient_code")
+        .eq("user_id", authData.user.id)
+        .single();
+      if (patientError || !patientRow?.id) {
+        console.error("AMAN SOS patient lookup failed", patientError);
+        setNotice(isAr ? "لم نعثر على ملف المريض المرتبط بهذا الحساب في Supabase." : "No Supabase patient record is linked to this account.");
+        return;
+      }
+
+      const { data: approvedConnections, error: connectionsError } = await supabase
+        .from("aman_patient_access_requests")
+        .select("requester_role")
+        .eq("patient_id", patientRow.id)
+        .eq("status", "approved");
+      // This lookup is only for the confirmation message. The database RLS policy
+      // controls who can actually read the alert, so a lookup/read-permission issue
+      // must never block the patient's SOS insert.
+      if (connectionsError) console.warn("AMAN SOS recipient label lookup failed", connectionsError);
+
+      const patientName = current.name || activePatient.name;
+      const patientCode = patientRow.patient_code || current.patientId || activePatient.id;
+      const message = isAr ? "طلب المريض مساعدة طارئة عبر زر SOS." : "The patient requested emergency assistance using the SOS button.";
+      const { data, error } = await supabase.from("aman_emergency_alerts").insert({
+        patient_id: patientRow.id,
+        created_by: authData.user.id,
+        patient_code: patientCode,
+        patient_name: patientName,
+        alert_type: "sos",
+        message,
+        status: "active",
+      }).select("id, patient_id, patient_code, patient_name, message, created_at, status").single();
+
+      if (error || !data) {
+        console.error("AMAN SOS insert failed", error);
+        setNotice(isAr ? "تعذر إرسال التنبيه. تأكدي من نجاح تحديث أعمدة الطوارئ ومن صلاحيات قاعدة البيانات." : "SOS could not be sent. Check the emergency column update and database permissions.");
+        return;
+      }
+
+      setAppData((prev) => ({ ...prev, patients: prev.patients.map((p) => p.id === activePatient.id ? { ...p, alerts: [{ level: "red" as const, text: isAr ? "تم إرسال طلب مساعدة طارئة" : "Emergency SOS request sent", date: createdAt }, ...p.alerts] } : p) }));
+      playEmergencyTone();
+      const approvedRoles = new Set((approvedConnections || []).map((connection: { requester_role: string }) => connection.requester_role));
+      const recipientLabels = [
+        ...(approvedRoles.has("doctor") ? [isAr ? "الطبيب" : "the doctor"] : []),
+        ...(approvedRoles.has("guardian") ? [isAr ? "العائلة" : "family"] : []),
+      ];
+      if (recipientLabels.length) {
+        setNotice(isAr
+          ? `تم حفظ التنبيه وإتاحته لـ ${recipientLabels.join(" و ")} المرتبطين والمصرح لهم.`
+          : `The alert was saved and made available to approved ${recipientLabels.join(" and ")}.`);
+      } else {
+        setNotice(isAr
+          ? "تم حفظ طلب الطوارئ، لكن لا يوجد طبيب أو فرد عائلة وافق المريض على ربطه بعد؛ لذلك لن يستلمه أحد حتى يتم الربط والموافقة."
+          : "The emergency alert was saved, but no doctor or family member has been approved for this patient yet, so no recipient can receive it until access is granted.");
+      }
+    } catch (error) {
+      console.error("AMAN SOS error", error);
+      setNotice(isAr ? "تعذر الاتصال بخدمة الطوارئ. حاولي مرة أخرى." : "Could not connect to the emergency service. Please try again.");
+    }
+  }
+
+  function acknowledgeManualEmergency() {
+    setManualEmergency((prev) => prev ? { ...prev, acknowledged: true } : prev);
+    stopEmergencyTone();
+  }
+
+  useEffect(() => () => stopEmergencyTone(), []);
+
+  // Doctors and guardians receive database changes only for patients allowed by the table's RLS policy.
+  useEffect(() => {
+    if (!current || (current.role !== "doctor" && current.role !== "guardian") || screen !== "dashboard" || previewMode) return;
+
+    let cancelled = false;
+    let channel: any = null;
+    const supabase = createClient();
+
+    const loadActiveEmergency = async () => {
+      const { data, error } = await supabase
+        .from("aman_emergency_alerts")
+        .select("id, patient_id, patient_code, patient_name, message, created_at, status")
+        .eq("status", "active")
+        .order("created_at", { ascending: false })
+        .limit(1);
+
+      if (cancelled) return;
+      if (error) {
+        console.warn("AMAN SOS initial load failed", error);
+        return;
+      }
+      if (data?.[0]) {
+        setLiveEmergency(data[0]);
+        playEmergencyTone();
+      }
+    };
+
+    void loadActiveEmergency();
+
+    channel = supabase
+      .channel(`aman-emergency-${current.id}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "aman_emergency_alerts" }, (payload) => {
+        const row = (payload.new || payload.old) as {
+          id?: string;
+          patient_id?: string;
+          patient_code?: string;
+          patient_name?: string;
+          message?: string;
+          created_at?: string;
+          status?: string;
+        };
+        if (!row?.id) return;
+
+        if (payload.eventType === "DELETE" || row.status !== "active") {
+          setLiveEmergency((previous) => previous?.id === row.id ? null : previous);
+          stopEmergencyTone();
+          return;
+        }
+
+        setLiveEmergency({
+          id: row.id,
+          patient_id: row.patient_id || "",
+          patient_code: row.patient_code || "",
+          patient_name: row.patient_name || "AMAN Patient",
+          message: row.message || "Emergency help requested.",
+          created_at: row.created_at || new Date().toISOString(),
+          status: row.status || "active",
+        });
+        playEmergencyTone();
+      })
+      .subscribe((status: string) => {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          console.warn("AMAN SOS realtime channel status:", status);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      if (channel) void supabase.removeChannel(channel);
+      stopEmergencyTone();
+    };
+  }, [current?.id, current?.role, screen, previewMode]);
+
+  async function acknowledgeLiveEmergency() {
+    if (!liveEmergency) return;
+    try {
+      const supabase = createClient();
+      const { data: authData, error: authError } = await supabase.auth.getUser();
+      if (authError || !authData.user) {
+        setNotice(isAr ? "يرجى تسجيل الدخول لتأكيد استلام التنبيه." : "Sign in to acknowledge this alert.");
+        return;
+      }
+      const { error } = await supabase
+        .from("aman_emergency_alerts")
+        .update({ status: "acknowledged", acknowledged_by: authData.user.id, acknowledged_at: new Date().toISOString() })
+        .eq("id", liveEmergency.id)
+        .eq("status", "active");
+      if (error) throw error;
+      setLiveEmergency(null);
+      stopEmergencyTone();
+      setNotice(isAr ? "تم تأكيد استلام تنبيه الطوارئ." : "Emergency alert acknowledged.");
+    } catch (error) {
+      console.error("AMAN SOS acknowledgement failed", error);
+      setNotice(isAr ? "تعذر تأكيد استلام التنبيه. تحققي من صلاحيات الحساب." : "Could not acknowledge this alert. Check this account's access permissions.");
+    }
+  }
+
+  const isAr = lang === "ar";
+  const t = (key: string) => tr(key, lang);
+  const activePatient = useMemo(() => {
+    const targetId = selectedPatientId || current?.patientId || (current?.role === "doctor" ? appData.patients.find((p) => p.doctorId === current.id && p.status === "active")?.id || "" : "");
+    const matched = [...approvedLinkedPatients, ...appData.patients].find((p) => p.id === targetId);
+    // Keep demo data available, but select an approved real patient when one is explicitly selected.
+    return matched || (current?.role === "doctor" || current?.role === "guardian" ? approvedLinkedPatients[0] : null) || appData.patients.find((p) => p.status === "active") || appData.patients[0] || null;
+  }, [appData.patients, approvedLinkedPatients, selectedPatientId, current]);
+
+  useEffect(() => {
+    if (activePatient) {
+      setCarePlanDraft(activePatient.instructions);
+      setFollowUpValue(activePatient.followUp || "");
+    }
+  }, [activePatient?.id]);
+  useEffect(() => {
+    if (current) setProfileDraft({ name: current.name || "", contact: current.contact || "", title: current.title || "", specialty: current.specialty || "", professionalId: current.professionalId || "" });
+  }, [current?.id]);
+  const myPatients = useMemo(() => {
+    if (!current) return [];
+    const activeSamples = appData.patients.filter((p) => p.status === "active");
+    if (current.role === "doctor" || current.role === "guardian") {
+      const localLinked = appData.patients.filter((p) => p.doctorId === current.id || p.id === current.patientId);
+      const combined = [...approvedLinkedPatients, ...localLinked];
+      const unique = Array.from(new Map(combined.map(p => [p.id, p])).values());
+      // Keep demo patients visible alongside real approved patients.
+      const demos = activeSamples.filter(p => p.id.includes("demo") || p.id.startsWith("patient-"));
+      return [...unique, ...demos.filter(d => !unique.some(p => p.id === d.id))];
+    }
+    const linked = appData.patients.filter((p) => p.id === current.patientId);
+    return linked.length ? linked : activeSamples.slice(0, 1);
+  }, [appData.patients, current, approvedLinkedPatients]);
+  const filteredPatients = useMemo(() => myPatients.filter((p) => `${p.name} ${p.id} ${p.diagnosis}`.toLowerCase().includes(search.toLowerCase())), [myPatients, search]);
+
+  useEffect(() => {
+    try {
+      const isPublicPreview = new URLSearchParams(window.location.search).get("preview") === "1";
+      if (isPublicPreview) {
+        const demo = makeInitialData();
+        setAppData(demo);
+        const demoDoctor = demo.accounts.find((a) => a.role === "doctor") || null;
+        setCurrent(demoDoctor);
+        setRole("doctor");
+        setSelectedPatientId(demo.patients[0]?.id || "");
+        setScreen("dashboard");
+        setPreviewMode(true);
+      } else {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        const demoDefaults = makeInitialData();
+        if (saved) {
+          const parsed = JSON.parse(saved) as Partial<AppState>;
+          setAppData({
+            patients: Array.isArray(parsed.patients) && parsed.patients.length ? parsed.patients : demoDefaults.patients,
+            accounts: Array.isArray(parsed.accounts) && parsed.accounts.length ? parsed.accounts : demoDefaults.accounts,
+          });
+        } else {
+          setAppData(demoDefaults);
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(demoDefaults));
+        }
+        // Restore only a real Supabase session; never trust a cached local account as authentication.
+        void (async () => {
+          try {
+            const supabase = createClient();
+            const { data: auth } = await supabase.auth.getUser();
+            if (!auth.user) { localStorage.removeItem(CURRENT_KEY); return; }
+            const { data: profile } = await supabase.from("aman_profiles").select("role,full_name,contact_email,professional_title,specialty,relationship").eq("user_id", auth.user.id).maybeSingle();
+            if (!profile) return;
+            const { data: saved } = await supabase.from("aman_user_app_data").select("app_data").eq("user_id", auth.user.id).maybeSingle();
+            if (saved?.app_data) setAppData(saved.app_data as AppState);
+            let patientId = "";
+            if (profile.role === "patient") {
+              const { data: patient } = await supabase.from("aman_patients").select("id").eq("user_id", auth.user.id).maybeSingle();
+              patientId = patient?.id || "";
+            }
+            const acct: Account = { id: auth.user.id, role: profile.role as Role, name: profile.full_name || auth.user.email || "AMAN User", contact: profile.contact_email || auth.user.email || "", password: "", ...(profile.professional_title ? {title:profile.professional_title}:{}), ...(profile.specialty ? {specialty:profile.specialty}:{}), ...(profile.relationship ? {relationship:profile.relationship}:{}), ...(patientId ? {patientId}:{}) };
+            const demoPatientId = makeInitialData().patients[0]?.id || "";
+            setRole(acct.role); setCurrent(acct); setSelectedPatientId(profile.role === "patient" ? demoPatientId : ""); setScreen("dashboard");
+            if (acct.role === "doctor" || acct.role === "guardian") window.setTimeout(() => { void refreshApprovedLinkedPatients(); }, 0);
+          } catch (e) { console.warn("AMAN session restore failed", e); }
+        })();
+      }
+      const settings = localStorage.getItem(SETTINGS_KEY);
+      if (settings) {
+        const parsed = JSON.parse(settings);
+        if (parsed.lang === "en" || parsed.lang === "ar") setLang(parsed.lang);
+        if (parsed.theme === "light" || parsed.theme === "dark") setTheme(parsed.theme);
+      }
+    } catch (e) {
+      console.warn("AMAN demo data could not be restored", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appData)); } catch (e) { console.warn(e); }
+  }, [appData]);
+  // Cloud backup: one private snapshot per authenticated account, restored on every device.
+  useEffect(() => {
+    if (!current || previewMode) return;
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      try {
+        const supabase = createClient();
+        const { data: auth } = await supabase.auth.getUser();
+        if (!cancelled && auth.user?.id === current.id) {
+          const { error } = await supabase.from("aman_user_app_data").upsert({ user_id: current.id, app_data: appData, updated_at: new Date().toISOString() }, { onConflict: "user_id" });
+          if (error) console.error("AMAN cloud save failed", error);
+        }
+      } catch (e) { console.error("AMAN cloud save failed", e); }
+    }, 900);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [appData, current?.id, previewMode]);
+  useEffect(() => {
+    const standalone = window.matchMedia?.("(display-mode: standalone)").matches || (navigator as Navigator & { standalone?: boolean }).standalone === true;
+    setIsInstalled(Boolean(standalone));
+
+    const onBeforeInstallPrompt = (event: Event) => {
+      event.preventDefault();
+      setInstallPrompt(event as InstallPromptEvent);
+    };
+    const onInstalled = () => {
+      setIsInstalled(true);
+      setInstallPrompt(null);
+      setNotice(lang === "ar" ? "تم تثبيت AMAN بنجاح." : "AMAN was installed successfully.");
+    };
+
+    window.addEventListener("beforeinstallprompt", onBeforeInstallPrompt);
+    window.addEventListener("appinstalled", onInstalled);
+
+    // The service worker only enables the installable app shell. It deliberately
+    // does not cache private patient records, account details, or API responses.
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("/sw.js").catch((error) => console.warn("AMAN service worker registration failed", error));
+    }
+
+    return () => {
+      window.removeEventListener("beforeinstallprompt", onBeforeInstallPrompt);
+      window.removeEventListener("appinstalled", onInstalled);
+    };
+  }, []);
+
+  useEffect(() => {
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify({ lang, theme })); } catch (e) { console.warn(e); }
+  }, [lang, theme]);
+
+  function updatePatients(fn: (patients: Patient[]) => Patient[]) {
+    setAppData((old) => ({ ...old, patients: fn(old.patients) }));
+  }
+  function updateAccounts(fn: (accounts: Account[]) => Account[]) {
+    setAppData((old) => ({ ...old, accounts: fn(old.accounts) }));
+  }
+  function openRole(nextRole: Role) {
+    setRole(nextRole); setAuthMode("login"); setFormError(""); setScreen("auth");
+    setLoginForm({ contact: "", password: "" });
+    setSignup({ name: "", contact: "", phone: "", password: "", nationalId: "", birthDate: "", patientId: "", relationship: "", title: "", specialty: "" });
+  }
+  async function signIn(event: FormEvent) {
+    event.preventDefault(); setFormError("");
+    const email = loginForm.contact.trim().toLowerCase();
+    if (!email.includes("@")) {
+      setFormError(isAr ? "استخدمي البريد الإلكتروني المسجل في الحساب حاليًا." : "Please use the email address registered to your account.");
+      return;
+    }
+    try {
+      const supabase = createClient();
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password: loginForm.password });
+      if (error || !data.user) {
+        const message = error?.message || "Authentication failed";
+        console.error("AMAN sign-in rejected:", message);
+        setFormError(isAr ? (message.toLowerCase().includes("email not confirmed") ? "البريد الإلكتروني غير مؤكد. افتحي رسالة التأكيد أولًا." : message.toLowerCase().includes("invalid login credentials") ? "البريد أو كلمة المرور غير صحيحة. إذا أنشأتِ الحساب ولم تؤكدي البريد، أعيدي إرسال التأكيد." : `تعذر الدخول: ${message}`) : message);
+        return;
+      }
+      const { data: profile, error: profileError } = await supabase
+        .from("aman_profiles")
+        .select("*")
+        .eq("user_id", data.user.id)
+        .maybeSingle();
+      if (profileError || !profile) {
+  console.error("AMAN PROFILE ERROR:", profileError);
+  setFormError(
+    profileError
+      ? `Profile error: ${profileError.message} (${profileError.code ?? "no code"})`
+      : "No profile found for this user."
+  );
+  return;
+}
+      
+      if (profile.role !== role) {
+        await supabase.auth.signOut();
+        setFormError(isAr ? "هذا الحساب مسجل بواجهة مختلفة. اختاري نوع الحساب الصحيح." : "This account belongs to a different role. Choose the matching account type.");
+        return;
+      }
+      // Guardian sign-ups keep the requested Patient ID in auth metadata so the request
+      // can be safely created after email confirmation and the first successful sign-in.
+      if (profile.role === "guardian") {
+        const savedPatientCode = String(data.user.user_metadata?.patient_code || "").trim();
+        if (savedPatientCode) {
+          const { error: linkError } = await supabase.rpc("aman_request_patient_access", {
+            p_patient_code: savedPatientCode,
+            p_requester_role: "guardian",
+          });
+          if (linkError) {
+            console.warn("Guardian access request could not be created after sign-in", linkError);
+            setNotice(isAr ? "تم تسجيل الدخول، لكن تعذر إرسال طلب ربط المريض. يمكنك إعادة إرساله من لوحة العائلة." : "Signed in, but the patient-link request could not be sent. You can retry from the family dashboard.");
+          } else {
+            setNotice(isAr ? "تم إرسال طلب ربط المريض وينتظر موافقته." : "Patient-link request sent and waiting for approval.");
+          }
+        }
+      }
+      let patientId = "";
+      if (profile.role === "patient") {
+        const { data: patient } = await supabase.from("aman_patients").select("id").eq("user_id", data.user.id).maybeSingle();
+        patientId = patient?.id || "";
+      }
+      const { data: cloudSnapshot, error: snapshotError } = await supabase.from("aman_user_app_data").select("app_data").eq("user_id", data.user.id).maybeSingle();
+      if (snapshotError) console.warn("AMAN cloud data could not be loaded", snapshotError);
+      if (cloudSnapshot?.app_data) setAppData(cloudSnapshot.app_data as AppState);
+      const account: Account = {
+        id: data.user.id,
+        role: profile.role as Role,
+        name: profile.full_name || data.user.email || "AMAN User",
+        contact: profile.contact_email || data.user.email || email,
+        password: "",
+        ...(profile.professional_title ? { title: profile.professional_title } : {}),
+        ...(profile.specialty ? { specialty: profile.specialty } : {}),
+        ...(profile.relationship ? { relationship: profile.relationship } : {}),
+        ...(patientId ? { patientId } : {}),
+      };
+      setCurrent(account); setSelectedPatientId(patientId); setScreen("dashboard"); setTab("overview");
+      if (role === "doctor" || role === "guardian") { window.setTimeout(() => { void refreshApprovedLinkedPatients(); }, 0); }
+      if (profile.role === "doctor" || profile.role === "guardian") { window.setTimeout(() => { void refreshApprovedLinkedPatients(); }, 0); }
+      try { localStorage.setItem(CURRENT_KEY, JSON.stringify(account)); } catch {}
+    } catch (error) {
+      console.error("AMAN sign-in error", error);
+      setFormError(isAr ? "تعذر الاتصال بالخادم. تحققي من اتصال الإنترنت وإعدادات Supabase." : "Could not connect to the server. Check your internet connection and Supabase settings.");
+    }
+  }
+  async function createAccount(event: FormEvent) {
+    event.preventDefault(); setFormError("");
+    if (!signup.name.trim() || !signup.contact.trim() || !signup.phone.trim() || signup.password.length < 8) { setFormError(t("required")); return; }
+    const email = signup.contact.trim().toLowerCase();
+    if (!email.includes("@")) { setFormError(isAr ? "أدخلي بريدًا إلكترونيًا صحيحًا." : "Enter a valid email address."); return; }
+    const phone = signup.phone.replace(/[\s()-]/g, "");
+    if (!/^\+?[1-9]\d{7,14}$/.test(phone)) { setFormError(isAr ? "أدخلي رقم جوال صحيحًا مع مفتاح الدولة، مثل +9665XXXXXXXX." : "Enter a valid phone number with country code, e.g. +9665XXXXXXXX."); return; }
+    if (role === "patient" && (!signup.nationalId.trim() || !signup.birthDate)) { setFormError(t("required")); return; }
+    if (role === "guardian" && (!signup.patientId.trim() || !signup.relationship.trim())) { setFormError(t("required")); return; }
+    if (role === "doctor" && (!signup.title.trim() || !signup.specialty.trim())) { setFormError(t("required")); return; }
+    try {
+      const supabase = createClient();
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password: signup.password,
+        options: {
+          emailRedirectTo: `${window.location.origin}/`,
+          data: {
+            full_name: signup.name.trim(),
+            phone,
+            role,
+            date_of_birth: role === "patient" ? signup.birthDate : null,
+            professional_title: role === "doctor" ? signup.title.trim() : null,
+            specialty: role === "doctor" ? signup.specialty.trim() : null,
+            patient_code: role === "guardian" ? signup.patientId.trim() : null,
+            relationship: role === "guardian" ? signup.relationship.trim() : null,
+          },
+        },
+      });
+      if (error) {
+        setFormError(error.message.toLowerCase().includes("already registered")
+          ? (isAr ? "هذا البريد مسجل مسبقًا. سجلي الدخول بدل إنشاء حساب جديد." : "This email is already registered. Sign in instead.")
+          : error.message);
+        return;
+      }
+      if (!data.session) {
+        setNotice(isAr ? "تم إنشاء الحساب. افتحي بريدك الإلكتروني واضغطي رابط التأكيد، ثم سجلي الدخول." : "Account created. Check your email and click the confirmation link, then sign in.");
+        setAuthMode("login");
+        setLoginForm({ contact: email, password: "" });
+        return;
+      }
+      const { data: profile, error: profileError } = await supabase
+        .from("aman_profiles")
+        .select("*")
+        .eq("user_id", data.user?.id)
+        .maybeSingle();
+      if (profileError || !profile) {
+        setNotice(isAr ? "تم إنشاء الحساب. سجلي الخروج ثم ادخلي بعد تأكيد البريد لتحميل ملفك." : "Account created. Sign in after confirming your email to load your profile.");
+        setAuthMode("login");
+        return;
+      }
+      let guardianRequestResult = "";
+      if (role === "guardian" && data.user && signup.patientId.trim()) {
+        const { error: guardianLinkError } = await supabase.rpc("aman_request_patient_access", {
+          p_patient_code: signup.patientId.trim(),
+          p_requester_role: "guardian",
+        });
+        guardianRequestResult = guardianLinkError
+          ? (isAr ? "تم إنشاء الحساب، لكن تعذر إرسال طلب ربط المريض. أعيدي المحاولة من لوحة العائلة." : "Account created, but the patient-link request failed. Retry from the family dashboard.")
+          : (isAr ? "تم إنشاء الحساب وإرسال طلب الربط. ينتظر موافقة المريض." : "Account created and link request sent. Waiting for patient approval.");
+      }
+      let patientId = "";
+      if (role === "patient" && data.user) {
+        const { data: patient } = await supabase.from("aman_patients").select("patient_code").eq("user_id", data.user.id).maybeSingle();
+        patientId = patient?.patient_code || "";
+      }
+      const account: Account = {
+        id: data.user!.id, role, name: profile.full_name || signup.name.trim(),
+        contact: profile.contact_email || email, password: "",
+        ...(profile.professional_title ? { title: profile.professional_title } : {}),
+        ...(profile.specialty ? { specialty: profile.specialty } : {}),
+        ...(profile.relationship ? { relationship: profile.relationship } : {}),
+        ...(patientId ? { patientId } : {}),
+      };
+      setCurrent(account); setSelectedPatientId(patientId); setScreen("dashboard"); setTab("overview");
+      try { localStorage.setItem(CURRENT_KEY, JSON.stringify(account)); } catch {}
+      if (role === "guardian") setNotice(guardianRequestResult || (isAr ? "تم إنشاء حسابك. استخدمي معرّف المريض لإرسال طلب الربط." : "Your account is created. Use the Patient ID to send a link request."));
+      if (role === "doctor") setNotice(isAr ? "تم إنشاء الحساب. توثيق بيانات الطبيب وربط المرضى يحتاجان الخطوة التالية." : "Your account is created. Doctor verification and patient linking are a later step.");
+      if (role === "patient" && patientId) setNotice(`${isAr ? "معرّف المريض الخاص بك" : "Your patient ID"}: ${patientId}`);
+    } catch (error) {
+      console.error("AMAN sign-up error", error);
+      setFormError(isAr ? "تعذر الاتصال بالخادم. تحققي من اتصال الإنترنت وإعدادات Supabase." : "Could not connect to the server. Check your internet connection and Supabase settings.");
+    }
+  }
+  function demoLogin(nextRole: Role) {
+    const account = appData.accounts.find((a) => a.id === `${nextRole === "doctor" ? "doctor" : nextRole === "guardian" ? "guardian" : "patient"}-demo`) || makeInitialData().accounts.find((a) => a.role === nextRole);
+    if (!account) return;
+    setRole(nextRole); setCurrent(account); setSelectedPatientId(account.patientId || ""); setScreen("dashboard"); setTab("overview"); setNotice("");
+    try { localStorage.setItem(CURRENT_KEY, JSON.stringify(account)); } catch {}
+  }
+  function signOut() { setShowLogoutConfirm(true); }
+  async function confirmSignOut() {
+    try { await createClient().auth.signOut(); } catch (error) { console.warn("AMAN sign-out error", error); }
+    setCurrent(null); setScreen("welcome"); setSelectedPatientId(""); setTab("overview"); setShowLogoutConfirm(false); setPreviewMode(false);
+    try { localStorage.removeItem(CURRENT_KEY); } catch {}
+  }
+  async function sharePreviewLink() {
+    const url = `${window.location.origin}/?preview=1`;
+    const shareData = {
+      title: "AMAN · Connected care",
+      text: isAr ? "استكشف واجهة AMAN ببيانات تجريبية فقط." : "Explore the AMAN interface using sample data only.",
+      url,
+    };
+    try {
+      if (navigator.share) {
+        await navigator.share(shareData);
+        setNotice(isAr ? "تم فتح خيارات المشاركة." : "Share options opened.");
+        return;
+      }
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(url);
+        setNotice(isAr ? `تم نسخ رابط المعاينة: ${url} — يلزم نشر الموقع ليعمل عند الآخرين.` : `Preview link copied: ${url} — publish the app before others can open it.`);
+        return;
+      }
+      window.prompt(isAr ? "انسخي رابط المعاينة بعد نشر التطبيق:" : "Copy the preview link after deploying the app:", url);
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") return;
+      window.prompt(isAr ? "انسخي رابط المعاينة بعد نشر التطبيق:" : "Copy the preview link after deploying the app:", url);
+    }
+  }
+
+  async function installApp() {
+    if (isInstalled) {
+      setNotice(isAr ? "AMAN مثبت بالفعل على هذا الجهاز." : "AMAN is already installed on this device.");
+      return;
+    }
+    if (installPrompt) {
+      await installPrompt.prompt();
+      const choice = await installPrompt.userChoice;
+      setInstallPrompt(null);
+      setNotice(choice.outcome === "accepted"
+        ? (isAr ? "بدأ تثبيت AMAN." : "AMAN installation started.")
+        : (isAr ? "يمكنك تثبيت AMAN لاحقًا من قائمة المتصفح." : "You can install AMAN later from your browser menu."));
+      return;
+    }
+    setNotice(isAr
+      ? "للتثبيت: على iPhone افتحي الموقع في Safari ثم مشاركة ← إضافة إلى الشاشة الرئيسية. على الكمبيوتر أو Android استخدمي قائمة المتصفح ثم Install AMAN أو Add to Home screen. يلزم فتح رابط الموقع المنشور عبر HTTPS."
+      : "To install: on iPhone, open the published site in Safari, tap Share, then Add to Home Screen. On desktop or Android, use the browser menu and choose Install AMAN or Add to Home screen. The published site must use HTTPS.");
+  }
+
+  function exportDataBackup() {
+    try {
+      const backup = {
+        format: "aman-local-backup",
+        version: 1,
+        savedAt: new Date().toISOString(),
+        appData,
+        settings: { lang, theme },
+      };
+      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = `aman-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(objectUrl);
+      setNotice(isAr ? "تم تنزيل نسخة احتياطية. احتفظي بها في مكان خاص وآمن." : "Backup downloaded. Keep this file private and secure.");
+    } catch {
+      setNotice(isAr ? "تعذر تنزيل النسخة الاحتياطية." : "Could not download the backup.");
+    }
+  }
+
+  function importDataBackup() {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json,application/json";
+    input.onchange = () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const parsed = JSON.parse(String(reader.result));
+          const data = parsed?.appData;
+          if (parsed?.format !== "aman-local-backup" || !Array.isArray(data?.patients) || !Array.isArray(data?.accounts)) {
+            throw new Error("Invalid AMAN backup format");
+          }
+          setAppData({ patients: data.patients, accounts: data.accounts });
+          if (parsed.settings?.lang === "ar" || parsed.settings?.lang === "en") setLang(parsed.settings.lang);
+          if (parsed.settings?.theme === "light" || parsed.settings?.theme === "dark") setTheme(parsed.settings.theme);
+          setNotice(isAr ? "تم استرجاع بيانات النسخة الاحتياطية على هذا المتصفح." : "Backup restored to this browser.");
+        } catch {
+          setNotice(isAr ? "ملف النسخة الاحتياطية غير صالح أو غير مكتمل." : "This backup file is invalid or incomplete.");
+        }
+      };
+      reader.onerror = () => setNotice(isAr ? "تعذر قراءة ملف النسخة الاحتياطية." : "Could not read the backup file.");
+      reader.readAsText(file);
+    };
+    input.click();
+  }
+  function beginRecovery() {
+    setRecoveryContact(loginForm.contact.trim());
+    setRecoveryNotice("");
+    setFormError("");
+    setScreen("recovery");
+  }
+  async function requestRecoveryCode(event: FormEvent) {
+    event.preventDefault(); setRecoveryNotice("");
+    const email = recoveryContact.trim().toLowerCase();
+    if (!email.includes("@")) { setRecoveryNotice(isAr ? "استعادة كلمة المرور متاحة عبر البريد الإلكتروني حاليًا." : "Password recovery currently uses the account email address."); return; }
+    const { error } = await createClient().auth.resetPasswordForEmail(email, { redirectTo: `${window.location.origin}/reset-password` });
+    setRecoveryNotice(error ? (isAr ? `تعذر إرسال رابط الاستعادة: ${error.message}` : error.message) : (isAr ? "أرسلنا رابط تغيير كلمة المرور إلى بريدك. افتحيه من نفس المتصفح." : "Password reset link sent. Open it in this browser."));
+  }
+  function saveProfile(event: FormEvent) {
+    event.preventDefault(); if (previewMode) { setNotice(isAr ? "هذه معاينة للعرض فقط؛ التعديلات معطلة." : "This is a read-only preview; changes are disabled."); return; }
+    if (!current || !profileDraft.name.trim() || !profileDraft.contact.trim()) {
+      setNotice(isAr ? "أكملي الاسم وبيانات التواصل." : "Please complete the name and contact fields.");
+      return;
+    }
+    const updated: Account = { ...current, name: profileDraft.name.trim(), contact: profileDraft.contact.trim(), title: profileDraft.title.trim(), specialty: profileDraft.specialty.trim(), professionalId: profileDraft.professionalId.trim() };
+    setCurrent(updated);
+    setAppData((old) => ({ ...old, accounts: old.accounts.map((a) => a.id === updated.id ? updated : a) }));
+    try { localStorage.setItem(CURRENT_KEY, JSON.stringify(updated)); } catch {}
+    setNotice(isAr ? "تم تحديث بيانات الملف الشخصي." : "Profile details updated.");
+  }
+  function uploadProfilePicture(event: ChangeEvent<HTMLInputElement>) {
+    if (previewMode) { setNotice(isAr ? "هذه معاينة للعرض فقط؛ التعديلات معطلة." : "This is a read-only preview; changes are disabled."); return; }
+    const file = event.target.files?.[0];
+    if (!file || !current) return;
+    if (!file.type.startsWith("image/")) { setNotice(isAr ? "اختاري ملف صورة صالحًا." : "Choose a valid image file."); return; }
+    if (file.size > 2 * 1024 * 1024) { setNotice(isAr ? "حجم الصورة يجب ألا يتجاوز 2 ميجابايت." : "Image must be 2 MB or smaller."); return; }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const updated = { ...current, avatarData: String(reader.result || "") };
+      setCurrent(updated);
+      setAppData((old) => ({ ...old, accounts: old.accounts.map((a) => a.id === updated.id ? updated : a) }));
+      try { localStorage.setItem(CURRENT_KEY, JSON.stringify(updated)); } catch {}
+      setNotice(isAr ? "تم تحديث الصورة على هذا المتصفح." : "Profile photo updated in this browser.");
+    };
+    reader.readAsDataURL(file);
+  }
+  function removeProfilePicture() {
+    if (previewMode) { setNotice(isAr ? "هذه معاينة للعرض فقط؛ التعديلات معطلة." : "This is a read-only preview; changes are disabled."); return; }
+    if (!current) return;
+    const updated = { ...current, avatarData: "" };
+    setCurrent(updated);
+    setAppData((old) => ({ ...old, accounts: old.accounts.map((a) => a.id === updated.id ? updated : a) }));
+    try { localStorage.setItem(CURRENT_KEY, JSON.stringify(updated)); } catch {}
+    setNotice(isAr ? "تم حذف الصورة من الملف الشخصي." : "Profile photo removed.");
+  }
+  function startVoiceInput(target: "symptom" | "message") {
+    const w = window as any;
+    const Recognition = w.SpeechRecognition || w.webkitSpeechRecognition;
+    if (!Recognition) {
+      setNotice(isAr ? "التعرف على الصوت غير مدعوم في هذا المتصفح. يمكنك الكتابة بدلًا منه." : "Speech recognition is not supported in this browser. You can type instead.");
+      return;
+    }
+    const recognition = new Recognition();
+    recognition.lang = lang === "ar" ? "ar-SA" : "en-US";
+    recognition.interimResults = false;
+    recognition.maxAlternatives = 1;
+    recognition.onresult = (event: any) => {
+      const transcript = event.results?.[0]?.[0]?.transcript || "";
+      if (target === "symptom") setSymptomText((old) => `${old}${old ? " " : ""}${transcript}`);
+      else setMessageText((old) => `${old}${old ? " " : ""}${transcript}`);
+      setNotice(isAr ? "راجعي النص المحوّل قبل الإرسال." : "Review the transcript before sending.");
+    };
+    recognition.onerror = () => setNotice(isAr ? "تعذر تحويل الصوت. حاولي مرة أخرى أو اكتبي الرسالة." : "Could not transcribe audio. Try again or type the message.");
+    recognition.start();
+  }
+  function readAloud(text: string) {
+    if (!("speechSynthesis" in window)) { setNotice(isAr ? "القراءة الصوتية غير مدعومة في هذا المتصفح." : "Text-to-speech is not supported in this browser."); return; }
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = lang === "ar" ? "ar-SA" : "en-US";
+    window.speechSynthesis.speak(utterance);
+  }
+  async function addOrLinkPatient(event: FormEvent) {
+    event.preventDefault();
+    if (previewMode) { setNotice(isAr ? "هذه معاينة للعرض فقط؛ التعديلات معطلة." : "This is a read-only preview; changes are disabled."); return; }
+    setFormError("");
+    if (!current || current.role !== "doctor") return;
+
+    if (patientFormMode === "link") {
+      const success = await submitAccountAccessRequest(linkedPatientId, "doctor");
+      if (success) {
+        setShowAddPatient(false);
+        setLinkedPatientId("");
+      }
+      return;
+    }
+
+    // Live patient records must be created by the patient's own authenticated registration.
+    // The current schema does not contain the clinical/demographic fields for doctor-created records.
+    const { data: authData } = await createClient().auth.getUser();
+    if (authData.user) {
+      setFormError(isAr
+        ? "يجب أن ينشئ المريض حسابه أولًا من واجهة المريض. بعد ذلك استخدمي معرّف المريض لإرسال طلب ربط."
+        : "The patient must register through the patient account first. Then use their Patient ID to request access.");
+      return;
+    }
+
+    if (!newPatient.name.trim() || !newPatient.nationalId.trim() || !newPatient.birthDate || !newPatient.phone.trim()) { setFormError(t("required")); return; }
+    const existingNational = appData.patients.find((p) => p.nationalId === newPatient.nationalId.trim());
+    if (existingNational) { setFormError(t("idExists")); return; }
+    const id = createId();
+    const p: Patient = {
+      id, name: newPatient.name.trim(), nationalId: newPatient.nationalId.trim(), birthDate: newPatient.birthDate, phone: newPatient.phone.trim(),
+      diagnosis: newPatient.diagnosis.trim() || "To be completed", status: "active", bandMode: newPatient.bandMode, bandStatus: newPatient.bandStatus,
+      doctorId: current.id, guardians: [], vitals: { heartRate: 80, spo2: 97, temperature: 36.5, activity: 42 }, medications: [],
+      instructions: "Care team instructions will appear here.", symptoms: [], messages: [], alerts: [], audit: ["Patient record created · Doctor · Today"], followUp: "",
+    };
+    updatePatients((items) => [...items, p]); setSelectedPatientId(id); setShowAddPatient(false);
+    setNewPatient({ name: "", nationalId: "", birthDate: "", phone: "", diagnosis: "", bandMode: "prescribed", bandStatus: "active" });
+    setNotice(`${isAr ? "تم إنشاء ملف تجريبي محلي. معرّف المريض" : "Local demo record created. Patient ID"}: ${id}`);
+  }
+
+  function savePatientEdits(event: FormEvent) {
+    event.preventDefault(); if (previewMode) { setNotice(isAr ? "هذه معاينة للعرض فقط؛ التعديلات معطلة." : "This is a read-only preview; changes are disabled."); return; } if (!editPatient) return;
+    updatePatients((items) => items.map((p) => p.id === editPatient.id ? editPatient : p));
+    setSelectedPatientId(editPatient.id); setTab("profile"); setEditPatient(null); setNotice(isAr ? "تم حفظ بيانات المريض." : "Patient details saved.");
+  }
+  function updateMedication(patientId: string, medicationId: string, status: Medication["status"]) {
+    if (previewMode) { setNotice(isAr ? "هذه معاينة للعرض فقط؛ التعديلات معطلة." : "This is a read-only preview; changes are disabled."); return; }
+    updatePatients((items) => items.map((p) => p.id === patientId ? {
+      ...p,
+      medications: p.medications.map((m) => m.id === medicationId ? { ...m, status } : m),
+      audit: [`Medication status updated: ${medicationId} → ${status} · ${current?.name || "User"} · Today`, ...(p.audit || [])],
+    } : p));
+  }
+  function addMedication(event: FormEvent) {
+    event.preventDefault();
+    if (previewMode) { setNotice(isAr ? "هذه معاينة للعرض فقط؛ التعديلات معطلة." : "This is a read-only preview; changes are disabled."); return; }
+    if (!activePatient || !medicationForm.name.trim() || !medicationForm.dose.trim() || !medicationForm.time) {
+      setNotice(isAr ? "أكملي اسم الدواء والجرعة وموعد الجرعة." : "Complete the medication name, dose, and first dose time.");
+      return;
+    }
+    const times = [medicationForm.time];
+    if (medicationForm.frequency === "twice" || medicationForm.frequency === "three-times") times.push(medicationForm.secondTime);
+    if (medicationForm.frequency === "three-times") times.push(medicationForm.thirdTime);
+    const formattedTimes = times.map((value) => {
+      const [hours, minutes] = value.split(":"); const h = Number(hours);
+      return `${String((h % 12) || 12).padStart(2, "0")}:${minutes} ${h >= 12 ? "PM" : "AM"}`;
+    });
+    const existing = editingMedicationId ? activePatient.medications.find((m) => m.id === editingMedicationId) : undefined;
+    const newItem: Medication = { id: editingMedicationId || `med-${Date.now()}`, name: medicationForm.name.trim(), dose: medicationForm.dose.trim(), time: formattedTimes.join(" · "), scheduleTimes: times, frequency: medicationForm.frequency, startDate: medicationForm.startDate, endDate: medicationForm.endDate, status: existing?.status || "Due" };
+    updatePatients((items) => items.map((p) => p.id === activePatient.id ? { ...p, medications: editingMedicationId ? p.medications.map((m) => m.id === editingMedicationId ? newItem : m) : [...p.medications, newItem], audit: [`Medication ${editingMedicationId ? "updated" : "added"}: ${newItem.name} · ${current?.name || "Doctor"} · Today`, ...(p.audit || [])] } : p));
+    setMedicationForm({ name: "", dose: "", time: "08:00", secondTime: "14:00", thirdTime: "20:00", frequency: "once", startDate: "", endDate: "" });
+    setEditingMedicationId(null);
+    setNotice(isAr ? `✓ تم ${existing ? "تحديث" : "إضافة"} الدواء في جدول الأدوية على هذا المتصفح.` : `✓ Medication ${existing ? "updated" : "added"} in this browser’s schedule.`);
+  }
+  function editMedication(m: Medication) {
+    const times = m.scheduleTimes?.length ? m.scheduleTimes : ["08:00"];
+    setMedicationForm({ name: m.name, dose: m.dose, time: times[0] || "08:00", secondTime: times[1] || "14:00", thirdTime: times[2] || "20:00", frequency: m.frequency || (times.length >= 3 ? "three-times" : times.length === 2 ? "twice" : "once"), startDate: m.startDate || "", endDate: m.endDate || "" });
+    setEditingMedicationId(m.id);
+    setTab("medication");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+  function deleteMedication(m: Medication) {
+    if (!activePatient) return;
+    const confirmed = window.confirm(isAr ? `هل تريدين حذف الدواء ${m.name} من الخطة؟` : `Delete ${m.name} from the care plan?`);
+    if (!confirmed) return;
+    updatePatients((items) => items.map((p) => p.id === activePatient.id ? { ...p, medications: p.medications.filter((item) => item.id !== m.id), audit: [`Medication deleted: ${m.name} · ${current?.name || "Doctor"} · Today`, ...(p.audit || [])] } : p));
+    if (editingMedicationId === m.id) { setEditingMedicationId(null); setMedicationForm({ name: "", dose: "", time: "08:00", secondTime: "14:00", thirdTime: "20:00", frequency: "once", startDate: "", endDate: "" }); }
+    setNotice(isAr ? "تم حذف الدواء من جدول النموذج." : "Medication removed from this prototype schedule.");
+  }
+  function saveCarePlan(event: FormEvent) {
+    event.preventDefault(); if (previewMode) { setNotice(isAr ? "هذه معاينة للعرض فقط؛ التعديلات معطلة." : "This is a read-only preview; changes are disabled."); return; }
+    if (!activePatient) return;
+    updatePatients((items) => items.map((p) => p.id === activePatient.id ? { ...p, instructions: carePlanDraft, followUp: followUpValue, audit: [`Care plan updated${followUpValue ? ` · Follow-up ${followUpValue}` : ""} · ${current?.name || "Doctor"} · Today`, ...(p.audit || [])] } : p));
+    setNotice(isAr ? "تم حفظ الخطة العلاجية وموعد المتابعة في النموذج." : "Care plan and follow-up saved in the demo.");
+  }
+  function submitSymptom(event: FormEvent) {
+    event.preventDefault(); if (previewMode) { setNotice(isAr ? "هذه معاينة للعرض فقط؛ التعديلات معطلة." : "This is a read-only preview; changes are disabled."); return; } if (!activePatient || !symptomText.trim()) return;
+    updatePatients((items) => items.map((p) => p.id === activePatient.id ? { ...p, symptoms: [{ text: symptomText.trim(), date: new Date().toLocaleString(isAr ? "ar-SA" : "en-US"), source: current?.name || "Patient" }, ...p.symptoms] } : p));
+    setSymptomText(""); setNotice(isAr ? "✓ تم حفظ البلاغ في سجل المتابعة على هذا المتصفح." : "✓ Symptom report saved to this browser’s care log.");
+  }
+  function sendMessage(event: FormEvent) {
+    event.preventDefault(); if (previewMode) { setNotice(isAr ? "هذه معاينة للعرض فقط؛ الإرسال معطل." : "This is a read-only preview; sending is disabled."); return; } if (!activePatient || !messageText.trim() || !current) return;
+    const validRecipients = current.role === "doctor" ? ["Patient", "Authorized family"] : current.role === "guardian" ? ["Care team", "Patient"] : ["Care team", "Family/caregiver"];
+    const chosenRecipient = validRecipients.includes(messageRecipient) ? messageRecipient : validRecipients[0];
+    const recipient = current.role === "doctor" && chosenRecipient === "Patient" ? activePatient.name : chosenRecipient;
+    updatePatients((items) => items.map((p) => p.id === activePatient.id ? { ...p, messages: [...p.messages, { from: current.name, to: recipient, text: messageText.trim(), date: new Date().toLocaleString(isAr ? "ar-SA" : "en-US") }] } : p));
+    setMessageText("");
+    setNotice(isAr ? `تمت إضافة الرسالة إلى محادثة ${recipient} في هذا المتصفح.` : `Message added to the ${recipient} conversation in this browser.`);
+  }
+  function addFamilyContact(event: FormEvent) {
+    event.preventDefault(); if (previewMode) { setNotice(isAr ? "هذه معاينة للعرض فقط؛ التعديلات معطلة." : "This is a read-only preview; changes are disabled."); return; } if (!activePatient || !familyForm.name.trim() || !familyForm.phone.trim()) return;
+    updatePatients((items) => items.map((p) => p.id === activePatient.id ? { ...p, guardians: [...p.guardians, { ...familyForm, relationship: familyForm.relationship || "Family" }] } : p));
+    setFamilyForm({ name: "", phone: "", relationship: "" }); setNotice(isAr ? "تمت إضافة جهة الاتصال." : "Family contact added.");
+  }
+  function endCare(patient: Patient) {
+    if (previewMode) { setNotice(isAr ? "هذه معاينة للعرض فقط؛ التعديلات معطلة." : "This is a read-only preview; changes are disabled."); return; }
+    if (!window.confirm(t("confirmEnd"))) return;
+    updatePatients((items) => items.map((p) => p.id === patient.id ? { ...p, status: "completed", bandStatus: p.bandStatus === "active" ? "returned" : p.bandStatus, audit: [`Care episode completed and band marked returned · ${current?.name || "Doctor"} · Today`, ...(p.audit || [])] } : p));
+    setSelectedPatientId(patient.id); setNotice(isAr ? "تم إنهاء فترة الرعاية في بيانات النموذج." : "Care episode marked complete in the demo data.");
+  }
+  function removePatient(patient: Patient) {
+    if (previewMode) { setNotice(isAr ? "هذه معاينة للعرض فقط؛ التعديلات معطلة." : "This is a read-only preview; changes are disabled."); return; }
+    if (!window.confirm(isAr ? `هل تريد إزالة ${patient.name} من قائمة الطبيب؟ سيبقى الملف التجريبي محفوظًا للحفاظ على سجل الرعاية.` : `Remove ${patient.name} from your active doctor list? The demo record will be retained for care-history purposes.`)) return;
+    if (current?.role === "doctor") updatePatients((items) => items.map((p) => p.id === patient.id ? { ...p, doctorId: undefined } : p));
+    setSelectedPatientId(""); setTab("overview"); setNotice(isAr ? "تمت إزالة الربط من قائمة الطبيب." : "Patient unlinked from this doctor's list.");
+  }
+  function deletePatientRecord(patient: Patient) {
+    if (previewMode) { setNotice(isAr ? "هذه معاينة للعرض فقط؛ التعديلات معطلة." : "This is a read-only preview; changes are disabled."); return; }
+    if (!window.confirm(isAr ? `حذف ملف ${patient.name} وكل الحسابات المرتبطة به من بيانات هذا النموذج التجريبي؟ لا تستخدم هذا الإجراء لسجلات طبية حقيقية.` : `Permanently delete ${patient.name}'s record and linked demo accounts from this prototype? Never use this action for real clinical records.`)) return;
+    setAppData((old) => ({
+      patients: old.patients.filter((p) => p.id !== patient.id),
+      accounts: old.accounts.filter((a) => a.patientId !== patient.id && a.id !== patient.id),
+    }));
+    setSelectedPatientId(""); setTab("overview"); setNotice(isAr ? "تم حذف الملف من بيانات النموذج التجريبي." : "The record was deleted from this prototype's local data.");
+  }
+  function changeTab(next: string) { setTab(next); setNotice(""); }
+
+  const sidebarItems = current?.role === "doctor"
+    ? [{ key: "overview", icon: "grid", label: t("overview") }, { key: "patients", icon: "users", label: t("patients") }, { key: "monitoring", icon: "activity", label: t("monitoring") }, { key: "carePlan", icon: "shield", label: t("carePlan") }, { key: "medication", icon: "heart", label: t("medication") }, { key: "alerts", icon: "bell", label: t("alerts") }, { key: "messages", icon: "message", label: t("messages") }, { key: "settings", icon: "settings", label: t("settings") }]
+    : current?.role === "guardian"
+      ? [{ key: "overview", icon: "grid", label: t("overview") }, { key: "monitoring", icon: "activity", label: t("monitoring") }, { key: "medication", icon: "heart", label: t("medication") }, { key: "alerts", icon: "bell", label: t("alerts") }, { key: "messages", icon: "message", label: t("messages") }, { key: "settings", icon: "settings", label: t("settings") }]
+      : [{ key: "overview", icon: "grid", label: t("overview") }, { key: "monitoring", icon: "activity", label: t("monitoring") }, { key: "carePlan", icon: "shield", label: t("carePlan") }, { key: "medication", icon: "heart", label: t("medication") }, { key: "messages", icon: "message", label: t("messages") }, { key: "settings", icon: "settings", label: t("settings") }];
+
+  function topControls() {
+    return <div className="top-controls"><div className="setting-control"><span>{t("language")}</span><button className={`mini-choice ${lang === "en" ? "selected" : ""}`} onClick={() => setLang("en")}>EN</button><button className={`mini-choice ${lang === "ar" ? "selected" : ""}`} onClick={() => setLang("ar")}>ع</button></div><div className="setting-control"><span>{t("display")}</span><button aria-label={t("light")} className={`theme-choice ${theme === "light" ? "selected" : ""}`} onClick={() => setTheme("light")}><Icon name="sun" /></button><button aria-label={t("dark")} className={`theme-choice ${theme === "dark" ? "selected" : ""}`} onClick={() => setTheme("dark")}><Icon name="moon" /></button></div></div>;
+  }
+
+  function renderWelcome() {
+    return <main className="welcome-screen"><div className="welcome-top"><div className="brand small-brand"><div className="brand-mark"><Icon name="heart" /></div><span>AMAN</span></div>{topControls()}</div><div className="welcome-main"><div className="welcome-orb orb-one"/><div className="welcome-orb orb-two"/><div className="welcome-content">{notice && <div className="notice-banner welcome-notice"><span>{notice}</span><button onClick={() => setNotice("")}>×</button></div>}<div className="eyebrow"><span className="pulse-dot"/>{t("welcome")}</div><div className="welcome-wordmark">aman<span>.</span></div><div className="tagline">{t("tagline")}</div><p className="welcome-description">{t("welcomeBody")}</p><div className="welcome-actions"><button className="primary-button big-button" onClick={() => setScreen("role")}>{t("getStarted")} <Icon name={isAr ? "back" : "arrow"}/></button><button className="text-button" onClick={() => setScreen("role")}>{t("signIn")}</button><button className="outline-button share-preview-button" onClick={sharePreviewLink}><Icon name="share"/> {isAr ? "مشاركة رابط المعاينة" : "Share preview link"}</button><button className="outline-button" onClick={installApp} disabled={isInstalled}>{isInstalled ? (isAr ? "مثبّت" : "Installed") : (isAr ? "تثبيت AMAN" : "Install AMAN")}</button></div><div className="welcome-foot"><span><Icon name="shield"/> {isAr ? "خصوصية وصلاحيات واضحة" : "Privacy-aware care"}</span><span><Icon name="heart"/> {isAr ? "رعاية مترابطة" : "Connected recovery"}</span></div></div><div className="welcome-art"><div className="halo halo-a"/><div className="halo halo-b"/><div className="crosshair x1"/><div className="crosshair x2"/><div className="art-center"><div className="art-heart"><Icon name="heart"/></div><div className="art-pulse"><span/><span/><span/><span/><span/><span/><span/><span/><span/></div></div><div className="floating-tag tag-heart"><span className="float-icon"><Icon name="heart"/></span><div><b>Care, connected</b><small>Patient · Family · Doctor</small></div></div><div className="floating-tag tag-watch"><span className="float-icon"><Icon name="watch"/></span><div><b>AMAN Band</b><small>At-home monitoring</small></div></div><div className="floating-tag tag-signal"><span className="signal-dot"/> <span>Connected care</span></div></div></div><div className="welcome-bottom"><span>AMAN BAND</span><span>{isAr ? "سلامة المريض خارج جدران المستشفى" : "Patient safety beyond hospital walls"}</span></div></main>;
+  }
+
+  function renderRole() {
+    const options: { role: Role; icon: string; title: string; sub: string }[] = [
+      { role: "patient", icon: "heart", title: t("patient"), sub: t("patientSub") },
+      { role: "doctor", icon: "activity", title: t("doctor"), sub: t("doctorSub") },
+      { role: "guardian", icon: "users", title: t("guardian"), sub: t("guardianSub") },
+    ];
+    return <main className="auth-shell"><header className="auth-header"><button className="brand brand-button" onClick={() => setScreen("welcome")}><div className="brand-mark"><Icon name="heart" /></div><span>AMAN</span></button>{topControls()}</header><section className="role-panel"><button className="back-link" onClick={() => setScreen("welcome")}><Icon name={isAr ? "arrow" : "back"}/>{t("back")}</button><div className="section-kicker">AMAN CONNECT</div><h1>{t("roleTitle")}</h1><p className="section-subtitle">{t("roleSubtitle")}</p><div className="role-grid">{options.map((item) => <button className="role-card" key={item.role} onClick={() => openRole(item.role)}><div className="role-icon"><Icon name={item.icon}/></div><div className="role-copy"><h3>{item.title}</h3><p>{item.sub}</p></div><div className="role-arrow"><Icon name={isAr ? "back" : "arrow"}/></div></button>)}</div><div className="demo-strip"><span className="demo-strip-icon"><Icon name="shield"/></span><div><strong>{t("demo")}</strong><p>{t("demoNote")}</p></div></div></section><footer className="auth-footer">AMAN · {isAr ? "رعاية متصلة، في كل خطوة" : "Connected care, every step"}</footer></main>;
+  }
+
+  function renderAuth() {
+    return <main className="auth-shell"><header className="auth-header"><button className="brand brand-button" onClick={() => setScreen("welcome")}><div className="brand-mark"><Icon name="heart" /></div><span>AMAN</span></button>{topControls()}</header><section className="auth-layout"><div className="auth-aside"><div className="aside-icon"><Icon name={role === "doctor" ? "activity" : role === "guardian" ? "users" : "heart"}/></div><div className="section-kicker">{role === "doctor" ? "AMAN CLINICAL" : role === "guardian" ? "AMAN FAMILY" : "AMAN PATIENT"}</div><h1>{t(role)}</h1><p>{t(role === "doctor" ? "doctorSub" : role === "guardian" ? "guardianSub" : "patientSub")}</p><div className="aside-lines"><span/><span/><span/></div><div className="aside-note"><Icon name="shield"/><span>{isAr ? "رعاية أكثر أمانًا تبدأ باتصال موثوق." : "Better care starts with a trusted connection."}</span></div></div><div className="auth-card"><button className="back-link" onClick={() => setScreen("role")}><Icon name={isAr ? "arrow" : "back"}/>{t("back")}</button><div className="auth-tabs"><button className={authMode === "login" ? "active" : ""} onClick={() => { setAuthMode("login"); setFormError(""); }}>{t("signIn")}</button><button className={authMode === "signup" ? "active" : ""} onClick={() => { setAuthMode("signup"); setFormError(""); }}>{t("createAccount")}</button></div><h2>{t(authMode === "login" ? "signInIntro" : "createIntro")}</h2>{authMode === "login" ? <form className="form-stack" onSubmit={signIn}><label>{t("mobileEmail")}<input autoComplete="username" value={loginForm.contact} onChange={(e) => setLoginForm({ ...loginForm, contact: e.target.value })} placeholder={isAr ? "أدخل رقم الجوال أو البريد" : "Enter mobile or email"} required /></label><label>{t("password")}<div className="password-field"><input autoComplete="current-password" type={showPassword ? "text" : "password"} value={loginForm.password} onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })} placeholder="••••••••" required /><button className="password-toggle" type="button" aria-label={showPassword ? (isAr ? "إخفاء كلمة المرور" : "Hide password") : (isAr ? "إظهار كلمة المرور" : "Show password")} onClick={() => setShowPassword((v) => !v)}>{showPassword ? "◉" : "◎"}</button></div></label><div className="login-options"><p className="field-hint">{t("loginHint")}</p><button type="button" className="text-link" onClick={beginRecovery}>{isAr ? "نسيت كلمة المرور؟" : "Forgot password?"}</button></div>{formError && <div className="error-message">{formError}</div>}<button className="primary-button full-button" type="submit">{t("login")} <Icon name={isAr ? "back" : "arrow"}/></button></form> : <form className="form-stack" onSubmit={createAccount}><label>{t("fullName")}<input value={signup.name} onChange={(e) => setSignup({ ...signup, name: e.target.value })} required placeholder={isAr ? "الاسم كما يظهر في الهوية" : "Enter full name"}/></label><label>{isAr ? "البريد الإلكتروني" : "Email address"}<input type="email" value={signup.contact} onChange={(e) => setSignup({ ...signup, contact: e.target.value })} required placeholder="name@example.com"/></label><label>{isAr ? "رقم الجوال (إجباري مع مفتاح الدولة)" : "Mobile number (required, with country code)"}<input type="tel" value={signup.phone} onChange={(e) => setSignup({ ...signup, phone: e.target.value })} required placeholder="+9665XXXXXXXX"/></label><label>{t("password")}<div className="password-field"><input type={showPassword ? "text" : "password"} minLength={8} autoComplete="new-password" value={signup.password} onChange={(e) => setSignup({ ...signup, password: e.target.value })} required placeholder={isAr ? "8 خانات على الأقل" : "At least 8 characters"}/><button className="password-toggle" type="button" aria-label={showPassword ? (isAr ? "إخفاء كلمة المرور" : "Hide password") : (isAr ? "إظهار كلمة المرور" : "Show password")} onClick={() => setShowPassword((v) => !v)}>{showPassword ? "◉" : "◎"}</button></div></label>{role === "patient" && <><div className="form-two"><label>{t("nationalId")}<input value={signup.nationalId} onChange={(e) => setSignup({ ...signup, nationalId: e.target.value })} required/></label><label>{t("birthDate")}<input type="date" value={signup.birthDate} onChange={(e) => setSignup({ ...signup, birthDate: e.target.value })} required/></label></div><div className="info-message"><Icon name="shield"/><span>{isAr ? "سيُنشأ لك معرّف مريض فريد بعد التسجيل. احتفظ به لربط المتابع والطبيب." : "A unique patient ID will be generated after sign-up. Keep it to connect your caregiver and doctor."}</span></div></>}{role === "guardian" && <><label>{t("patientId")}<input value={signup.patientId} onChange={(e) => setSignup({ ...signup, patientId: e.target.value })} required placeholder="AMAN-123456"/></label><label>{t("relationship")}<select value={signup.relationship} onChange={(e) => setSignup({ ...signup, relationship: e.target.value })} required><option value="">{isAr ? "اختر صلة القرابة" : "Select relationship"}</option><option value="Parent">{isAr ? "والد / والدة" : "Parent"}</option><option value="Spouse">{isAr ? "زوج / زوجة" : "Spouse"}</option><option value="Son / Daughter">{isAr ? "ابن / ابنة" : "Son / Daughter"}</option><option value="Sibling">{isAr ? "أخ / أخت" : "Sibling"}</option><option value="Other caregiver">{isAr ? "متابع حالة آخر" : "Other caregiver"}</option></select></label><p className="field-hint">{t("contactPermission")}</p><label className="consent-check"><input type="checkbox" required/><span>{t("fullConsent")}</span></label></>}{role === "doctor" && <><label>{t("doctorTitle")}<input value={signup.title} onChange={(e) => setSignup({ ...signup, title: e.target.value })} required placeholder={isAr ? "مثال: استشاري" : "e.g. Consultant Physician"}/></label><label>{t("specialty")}<input value={signup.specialty} onChange={(e) => setSignup({ ...signup, specialty: e.target.value })} required placeholder={isAr ? "مثال: طب الأسرة" : "e.g. Family Medicine"}/></label></>}{formError && <div className="error-message">{formError}</div>}<button className="primary-button full-button" type="submit">{t("create")} <Icon name={isAr ? "back" : "arrow"}/></button></form>}<div className="auth-switch"><span>{t(authMode === "login" ? "noAccount" : "hasAccount")}</span><button onClick={() => { setAuthMode(authMode === "login" ? "signup" : "login"); setFormError(""); }}>{t(authMode === "login" ? "createAccount" : "signIn")}</button></div><div className="demo-access"><div className="demo-title">{t("demoLogin")}</div><div className="demo-buttons"><button onClick={() => demoLogin("patient")}>{t("patientDemo")}</button><button onClick={() => demoLogin("doctor")}>{t("doctorDemo")}</button><button onClick={() => demoLogin("guardian")}>{t("guardianDemo")}</button></div><small>{isAr ? "لاستخدام الحسابات التجريبية: كلمة المرور demo123" : "Demo password: demo123 · These are simulated accounts."}</small></div></div></section><footer className="auth-footer">{t("demoWarning")}</footer></main>;
+  }
+
+  function renderRecovery() {
+    return <main className="auth-shell"><header className="auth-header"><button className="brand brand-button" onClick={() => setScreen("welcome")}><div className="brand-mark"><Icon name="heart" /></div><span>AMAN</span></button>{topControls()}</header><section className="recovery-panel"><button className="back-link" onClick={() => { setScreen("auth"); setAuthMode("login"); setRecoveryNotice(""); }}><Icon name={isAr ? "arrow" : "back"}/>{t("back")}</button><div className="section-kicker">AMAN ACCOUNT SECURITY</div><h1>{isAr ? "استعادة كلمة المرور" : "Recover your password"}</h1><p className="section-subtitle">{isAr ? "أدخلي البريد الإلكتروني أو رقم الجوال المرتبط بالحساب." : "Enter the email address or phone number linked to your account."}</p><form className="form-stack" onSubmit={requestRecoveryCode}><label>{t("mobileEmail")}<input value={recoveryContact} onChange={(e) => setRecoveryContact(e.target.value)} required autoComplete="username" placeholder={isAr ? "البريد الإلكتروني أو رقم الجوال" : "Email or mobile number"}/></label><button className="primary-button full-button" type="submit">{isAr ? "إرسال رمز التحقق" : "Send verification code"}</button></form>{recoveryNotice && <div className="info-message recovery-notice"><Icon name="shield"/><span>{recoveryNotice}</span></div>}<p className="field-hint">{isAr ? "سيصلك رابط آمن على البريد الإلكتروني المسجل." : "A secure reset link will be sent to your registered email."}</p></section></main>;
+  }
+
+  function headerTitle() {
+    if (tab === "settings") return t("settings");
+    if (tab === "patients") return t("patients");
+    if (tab === "monitoring") return t("monitoring");
+    if (tab === "carePlan") return t("carePlan");
+    if (tab === "medication") return t("medication");
+    if (tab === "alerts") return t("alerts");
+    if (tab === "messages") return t("messages");
+    if (tab === "profile") return t("patientProfile");
+    if (current?.role === "doctor") return t("overview");
+    if (current?.role === "guardian") return t("familyView");
+    return t("myHealth");
+  }
+
+  function metricCard(titleKey: string, value: string, unit: string, icon: string, tone: string, foot: string) {
+    return <div className="metric-card"><div className={`metric-icon ${tone}`}><Icon name={icon}/></div><div className="metric-label">{t(titleKey)}</div><div className="metric-value">{value}<span>{unit}</span></div><div className="metric-foot"><span className="metric-status-dot"/>{foot}</div></div>;
+  }
+
+  function renderAccountAccessPanel() {
+    if (!current || previewMode) return null;
+    const isPatient = current.role === "patient";
+    const title = isPatient
+      ? (isAr ? "طلبات الوصول إلى ملفك" : "Requests to access your record")
+      : (isAr ? "طلبات ربط المرضى" : "Patient access requests");
+    return <div className="panel account-access-panel">
+      <div className="panel-heading">
+        <div><h3>{title}</h3><p>{isPatient ? (isAr ? "لن يتمكن الطبيب أو فرد العائلة من الوصول قبل موافقتك." : "Doctors and family members cannot access your record until you approve.") : (isAr ? "حالة طلبات الربط المرسلة من حسابك." : "Status of link requests sent from your account.")}</p></div>
+        <span className="panel-icon"><Icon name="shield"/></span>
+      </div>
+      {!isPatient && <form className="inline-form account-access-form" onSubmit={async (event) => { event.preventDefault(); setFormError(""); const ok = await submitAccountAccessRequest(accessPatientCode); if (ok) setAccessPatientCode(""); }}>
+        <input value={accessPatientCode} onChange={(event) => setAccessPatientCode(event.target.value)} placeholder={isAr ? "أدخلي معرّف المريض AMAN-..." : "Enter Patient ID AMAN-..."} required />
+        <button className="primary-button" type="submit" disabled={accessBusy}>{accessBusy ? (isAr ? "جارٍ الإرسال..." : "Sending...") : (isAr ? "إرسال طلب الربط" : "Request access")}</button>
+      </form>}
+      {formError && !showAddPatient && <p className="error-message">{formError}</p>}
+      {accessLoadError && <p className="error-message">{accessLoadError}</p>}
+      {accessRequests.length ? <div className="access-request-list">{accessRequests.map((request) => <div className="access-request-row" key={request.id}>
+        <div className="access-request-copy">
+          <strong>{request.requester_role === "doctor" ? (isAr ? "طلب من طبيب" : "Doctor request") : (isAr ? "طلب من فرد عائلة" : "Family member request")}</strong>
+          <small>{new Date(request.created_at).toLocaleString(isAr ? "ar-SA" : "en-US")} · {request.id.slice(0, 8).toUpperCase()}</small>
+          {!isPatient && <small>{isAr ? "معرّف ملف المريض" : "Patient record ID"}: {request.patient_id.slice(0, 8).toUpperCase()}</small>}
+        </div>
+        <span className={`status-pill ${request.status === "approved" ? "green" : request.status === "rejected" ? "red" : "yellow"}`}>{request.status === "approved" ? (isAr ? "مقبول" : "Approved") : request.status === "rejected" ? (isAr ? "مرفوض" : "Rejected") : (isAr ? "بانتظار الموافقة" : "Pending")}</span>
+        {isPatient && request.status === "pending" && <div className="access-request-actions">
+          <button className="primary-button" disabled={accessBusy} onClick={() => void reviewAccountAccessRequest(request.id, "approved")}>{isAr ? "موافقة" : "Approve"}</button>
+          <button className="outline-button" disabled={accessBusy} onClick={() => void reviewAccountAccessRequest(request.id, "rejected")}>{isAr ? "رفض" : "Reject"}</button>
+        </div>}
+      </div>)}</div> : <p className="muted-text">{isPatient ? (isAr ? "لا توجد طلبات ربط واردة." : "No incoming access requests.") : (isAr ? "لم ترسلي أي طلب ربط بعد." : "You have not sent any patient-link requests yet.")}</p>}
+      <p className="small-note"><Icon name="shield"/>{isAr ? "الربط يتم عبر قاعدة البيانات، والوصول لا يُمنح إلا بعد موافقة المريض." : "Requests are stored in Supabase. Access is granted only after patient approval."}</p>
+    </div>;
+  }
+
+  function renderPatientTable() {
+    return <div className="panel table-panel"><div className="panel-heading"><div><h3>{t("patients")}</h3><p>{isAr ? "ملفات المرضى المرتبطة بحسابك" : "Patient records connected to your account"}</p></div><button className="outline-button" onClick={() => { setPatientFormMode("link"); setShowAddPatient(true); }}><Icon name="plus"/>{t("addPatient")}</button></div><div className="search-box"><Icon name="search"/><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder={t("searchPatients")}/></div><div className="table-wrap"><table><thead><tr><th>{t("patient")}</th><th>{t("patientId")}</th><th>{t("careStatus")}</th><th>{t("bandStatus")}</th><th></th></tr></thead><tbody>{filteredPatients.map((p) => <tr key={p.id}><td><div className="patient-cell"><div className="avatar">{p.name.split(" ").map((x) => x[0]).slice(0, 2).join("")}</div><div><strong>{p.name}</strong><small>{p.diagnosis}</small></div></div></td><td><span className="id-pill">{p.id}</span></td><td><span className={`status-pill ${p.status === "active" ? "green" : "gray"}`}>{t(p.status)}</span></td><td><span className={`status-pill ${p.bandStatus === "active" ? "blue" : "gray"}`}>{t(p.bandStatus === "active" ? "bandActive" : p.bandStatus === "returned" ? "bandReturned" : "bandNotIssued")}</span></td><td><button className="row-action" onClick={() => { setSelectedPatientId(p.id); setTab("profile"); }}>{t("viewProfile")}</button></td></tr>)}{filteredPatients.length === 0 && <tr><td colSpan={5} className="empty-cell">{t("noPatients")}</td></tr>}</tbody></table></div></div>;
+  }
+
+  function renderPatientSummary(p: Patient) {
+    return <><div className="metric-grid">{metricCard("heartRate", String(p.vitals.heartRate), "bpm", "heart", "rose", isAr ? "قراءة تجريبية" : "Simulated reading")}{metricCard("oxygen", String(p.vitals.spo2), "%", "activity", "blue", isAr ? "قراءة تجريبية" : "Simulated reading")}{metricCard("temperature", String(p.vitals.temperature), "°C", "sun", "amber", isAr ? "اتجاه تجريبي" : "Simulated trend")}{metricCard("activity", String(p.vitals.activity), "%", "activity", "green", isAr ? "هدف النشاط اليومي" : "Daily activity target")}</div><div className="dashboard-columns"><div className="panel"><div className="panel-heading"><div><h3>{t("todayPlan")}</h3><p>{t("carePlan")}</p></div><span className="panel-icon"><Icon name="shield"/></span></div><p className="care-instructions">{p.instructions}</p><div className="mini-info-row"><span>{t("band")}</span><strong>{t(p.bandMode)}</strong></div><div className="mini-info-row"><span>{t("bandStatus")}</span><strong>{t(p.bandStatus === "active" ? "bandActive" : p.bandStatus === "returned" ? "bandReturned" : "bandNotIssued")}</strong></div><div className="small-note"><Icon name="shield"/>{t("demoWarning")}</div></div><div className="panel"><div className="panel-heading"><div><h3>{t("medications")}</h3><p>{p.medications.length} {isAr ? "أدوية في الجدول" : "items in schedule"}</p></div><span className="panel-icon"><Icon name="heart"/></span></div>{p.medications.length ? <div className="medication-list">{p.medications.slice(0, 3).map((m) => <div className="med-row" key={m.id}><div className="med-dot"/><div className="med-info"><strong>{m.name}</strong><small>{m.dose} · {m.time}{m.startDate || m.endDate ? ` · ${m.startDate || "…"} – ${m.endDate || "…"}` : ""}</small></div><span className={`status-pill ${m.status === "Taken" ? "green" : m.status === "Skipped" ? "red" : "yellow"}`}>{t(m.status.toLowerCase())}</span></div>)}</div> : <p className="muted-text">{isAr ? "سيضيف الفريق الطبي الأدوية عند إعداد الخطة العلاجية." : "Your care team will add medications to your plan."}</p>}<button className="text-link" onClick={() => setTab("medication")}>{isAr ? "عرض جدول الأدوية ←" : "View medication schedule →"}</button></div></div></>;
+  }
+
+  function renderDoctorDashboard() {
+    const visible = myPatients;
+    const active = visible.filter((p) => p.status === "active").length;
+    const yellow = visible.filter((p) => p.alerts.some((a) => a.level === "yellow"));
+    const red = visible.filter((p) => p.alerts.some((a) => a.level === "red"));
+    if (tab === "patients") return <>{renderAccountAccessPanel()}{renderPatientTable()}</>;
+    if (tab === "profile" && activePatient) return renderDoctorPatientProfile(activePatient);
+    if (tab === "medication" && activePatient) return renderDoctorMedicationManager(activePatient);
+    if (tab === "carePlan" && activePatient) return renderDoctorCarePlan(activePatient);
+    if (tab === "monitoring") return <><div className="section-banner"><div><div className="section-kicker">AMAN CLINICAL</div><h2>{t("monitoring")}</h2><p>{isAr ? "مؤشرات الصحة واتجاهات التعافي التجريبية" : "Simulated health indicators and recovery trends"}</p></div></div>{visible.map((p) => <div className="panel patient-monitor-card" key={p.id}><div className="panel-heading"><div><h3>{p.name}</h3><p>{p.id} · {p.diagnosis}</p></div><button className="outline-button" onClick={() => { setSelectedPatientId(p.id); setTab("profile"); }}>{t("viewProfile")}</button></div>{renderPatientSummary(p)}</div>)}</>;
+    if (tab === "alerts") return <div className="panel"><div className="panel-heading"><div><h3>{t("recentAlerts")}</h3><p>{isAr ? "التنبيهات والبلاغات التي تحتاج مراجعة" : "Alerts and reports for clinical review"}</p></div></div>{visible.flatMap((p) => p.alerts.map((a, i) => ({ ...a, patient: p, key: `${p.id}-${i}` }))).length ? visible.flatMap((p) => p.alerts.map((a, i) => ({ ...a, patient: p, key: `${p.id}-${i}` }))).map((a) => <div className="alert-row" key={a.key}><span className={`alert-indicator ${a.level}`}/><div className="alert-copy"><strong>{a.patient.name}</strong><p>{a.text}</p><small>{a.date} · {a.patient.id}</small></div><button className="row-action" onClick={() => { setSelectedPatientId(a.patient.id); setTab("profile"); }}>{t("viewProfile")}</button></div>) : <p className="muted-text">{isAr ? "لا توجد تنبيهات مسجلة." : "No alerts have been recorded."}</p>}</div>;
+    if (tab === "messages") return activePatient ? renderMessages(activePatient) : <div className="panel"><h3>{t("messages")}</h3><p className="muted-text">{isAr ? "اختَر مريضًا من صفحة المرضى لفتح التواصل." : "Choose a patient from Patients to open their conversation."}</p><button className="primary-button" onClick={() => setTab("patients")}>{t("patients")}</button></div>;
+    if (tab === "settings") return renderSettings();
+    return <><div className="welcome-banner"><div><div className="section-kicker">AMAN CLINICAL</div><h2>{t("hello")}, {current?.name.split(" ")[0]}.</h2><p>{t("welcomeDashboard")}</p><div className="doctor-credentials"><span>{current?.title || (isAr ? "طبيب" : "Physician")}</span><i /><span>{current?.specialty || (isAr ? "التخصص غير محدد" : "Specialty not set")}</span></div></div><div className="banner-illustration"><div className="banner-circle"><Icon name="heart"/></div><div className="banner-ring"/></div></div>{renderAccountAccessPanel()}<div className="metric-grid four">{metricCard("enrolled", String(active), "", "users", "blue", isAr ? "حالات متابعة نشطة" : "Active care episodes")}{metricCard("stable", String(Math.max(0, active - yellow.length - red.length)), "", "shield", "green", isAr ? "ضمن العرض التجريبي" : "Demo overview")}{metricCard("review", String(yellow.length), "", "activity", "amber", isAr ? "تحتاج مراجعة" : "Needs attention")}{metricCard("urgent", String(red.length), "", "bell", "rose", isAr ? "تتطلب تقييمًا عاجلًا" : "Requires urgent assessment")}</div><div className="section-header"><div><h3>{t("patients")}</h3><p>{isAr ? "الوصول السريع إلى ملفات المرضى" : "Quick access to patient records"}</p></div><button className="outline-button" onClick={() => { setPatientFormMode("link"); setShowAddPatient(true); }}><Icon name="plus"/>{t("addPatient")}</button></div><div className="panel table-panel"><div className="search-box"><Icon name="search"/><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder={t("searchPatients")}/></div><div className="table-wrap"><table><thead><tr><th>{t("patient")}</th><th>{t("patientId")}</th><th>{t("careStatus")}</th><th>{t("alerts")}</th><th></th></tr></thead><tbody>{filteredPatients.slice(0, 5).map((p) => <tr key={p.id}><td><div className="patient-cell"><div className="avatar">{p.name.split(" ").map((x) => x[0]).slice(0, 2).join("")}</div><div><strong>{p.name}</strong><small>{p.diagnosis}</small></div></div></td><td><span className="id-pill">{p.id}</span></td><td><span className={`status-pill ${p.status === "active" ? "green" : "gray"}`}>{t(p.status)}</span></td><td><span className={`status-pill ${p.alerts.some((a) => a.level === "red") ? "red" : p.alerts.length ? "yellow" : "green"}`}>{p.alerts.length} {isAr ? "تنبيه" : "alerts"}</span></td><td><button className="row-action" onClick={() => { setSelectedPatientId(p.id); setTab("profile"); }}>{t("viewProfile")}</button></td></tr>)}{filteredPatients.length === 0 && <tr><td colSpan={5} className="empty-cell">{t("noPatients")}</td></tr>}</tbody></table></div><div className="panel-foot"><span>{t("demoWarning")}</span><button className="text-link" onClick={() => setTab("patients")}>{isAr ? "عرض جميع المرضى ←" : "View all patients →"}</button></div></div></>;
+  }
+
+  function renderDoctorPatientProfile(p: Patient) {
+    return <><div className="section-banner profile-banner"><div><button className="back-link" onClick={() => setTab("patients")}><Icon name={isAr ? "arrow" : "back"}/>{t("allPatients")}</button><div className="profile-title-row"><div className="avatar large-avatar">{p.name.split(" ").map((x) => x[0]).slice(0, 2).join("")}</div><div><h2>{p.name}</h2><p>{p.id} · {p.diagnosis}</p></div></div></div><div className="profile-actions"><button className="outline-button" onClick={() => setEditPatient({ ...p, guardians: [...p.guardians], medications: [...p.medications] })}>{t("edit")}</button><button className="danger-button" onClick={() => removePatient(p)}>{t("remove")}</button><button className="danger-button permanent-delete" onClick={() => deletePatientRecord(p)}>{isAr ? "حذف الملف" : "Delete record"}</button></div></div>{renderPatientSummary(p)}<div className="dashboard-columns"><div className="panel"><div className="panel-heading"><div><h3>{t("profile")}</h3><p>{t("patientId")}: {p.id}</p></div></div><div className="detail-list"><div><small>{t("nationalId")}</small><strong>{p.nationalId}</strong></div><div><small>{t("birthDate")}</small><strong>{p.birthDate}</strong></div><div><small>{t("phone")}</small><strong>{p.phone}</strong></div><div><small>{t("careStatus")}</small><strong>{t(p.status)}</strong></div><div><small>{t("bandMode")}</small><strong>{t(p.bandMode)}</strong></div><div><small>{t("bandStatus")}</small><strong>{t(p.bandStatus === "active" ? "bandActive" : p.bandStatus === "returned" ? "bandReturned" : "bandNotIssued")}</strong></div></div><div className="panel-actions"><button className="outline-button" onClick={() => { setTab("messages"); }}>{t("contactTeam")}</button>{p.status === "active" && <button className="primary-button" onClick={() => endCare(p)}>{t("endCare")}</button>}</div></div><div className="panel"><div className="panel-heading"><div><h3>{t("familyContacts")}</h3><p>{t("contactPermission")}</p></div><span className="panel-icon"><Icon name="users"/></span></div>{p.guardians.map((g, i) => <div className="contact-row" key={`${g.phone}-${i}`}><div className="avatar small-avatar">{g.name.split(" ").map((x) => x[0]).slice(0, 2).join("")}</div><div><strong>{g.name}</strong><small>{g.relationship} · {g.phone}</small></div></div>)}<form className="inline-form" onSubmit={addFamilyContact}><input placeholder={t("fullName")} value={familyForm.name} onChange={(e) => setFamilyForm({ ...familyForm, name: e.target.value })} required/><input placeholder={t("phone")} value={familyForm.phone} onChange={(e) => setFamilyForm({ ...familyForm, phone: e.target.value })} required/><input placeholder={t("relation")} value={familyForm.relationship} onChange={(e) => setFamilyForm({ ...familyForm, relationship: e.target.value })}/><button className="outline-button" type="submit">{t("addFamily")}</button></form></div></div><div className="dashboard-columns"><div className="panel"><div className="panel-heading"><div><h3>{t("recentSymptoms")}</h3><p>{isAr ? "بلاغات مقدمة من المريض" : "Reports submitted by the patient"}</p></div></div>{p.symptoms.map((s, i) => <div className="timeline-row" key={i}><span className="timeline-dot"/><div><p>{s.text}</p><small>{s.source} · {s.date}</small></div></div>)}{!p.symptoms.length && <p className="muted-text">—</p>}</div><div className="panel"><div className="panel-heading"><div><h3>{t("notes")}</h3><p>{isAr ? "آخر الرسائل المسجلة" : "Recent communication history"}</p></div></div>{p.messages.slice(-4).reverse().map((m, i) => <div className="timeline-row" key={i}><span className="timeline-dot blue-dot"/><div><strong>{m.from}</strong><p>{m.text}</p><small>{m.date}</small></div></div>)}{!p.messages.length && <p className="muted-text">{t("noMessages")}</p>}</div></div><div className="panel"><div className="panel-heading"><div><h3>{isAr ? "سجل التغييرات" : "Audit history"}</h3><p>{isAr ? "سجل تجريبي لتعديلات الخطة والأدوية" : "Demo log of care-plan and medication changes"}</p></div></div>{(p.audit || []).map((entry, i) => <div className="timeline-row" key={i}><span className="timeline-dot blue-dot"/><div><p>{entry}</p></div></div>)}</div></>;
+  }
+
+  function renderDoctorMedicationManager(p: Patient) {
+    return <><div className="section-banner"><div><div className="section-kicker">AMAN CLINICAL</div><h2>{t("medication")}</h2><p>{p.name} · {p.id}</p></div><button className="outline-button" onClick={() => { setTab("profile"); }}>{t("viewProfile")}</button></div><div className="dashboard-columns"><div>{renderMedicationPanel(p, false)}<div className="panel"><div className="panel-heading"><div><h3>{isAr ? "إضافة دواء للخطة" : "Add medication to plan"}</h3><p>{isAr ? "أدخل اسم الدواء والجرعة والموعد حسب وصفة الطبيب." : "Enter the medication, dose, and schedule as prescribed."}</p></div></div><form className="form-stack" onSubmit={addMedication}><label>{isAr ? "اسم الدواء" : "Medication name"}<input value={medicationForm.name} onChange={(e) => setMedicationForm({ ...medicationForm, name: e.target.value })} required /></label><label>{isAr ? "الجرعة" : "Dose"}<input value={medicationForm.dose} onChange={(e) => setMedicationForm({ ...medicationForm, dose: e.target.value })} required placeholder={isAr ? "حسب الوصفة الطبية" : "As prescribed"} /></label><label>{isAr ? "تكرار الجرعة" : "Dose frequency"}<select value={medicationForm.frequency} onChange={(e) => setMedicationForm({ ...medicationForm, frequency: e.target.value })}><option value="once">{isAr ? "مرة يوميًا" : "Once daily"}</option><option value="twice">{isAr ? "مرتين يوميًا" : "Twice daily"}</option><option value="three-times">{isAr ? "ثلاث مرات يوميًا" : "Three times daily"}</option><option value="prescribed">{isAr ? "حسب الوصفة (أضيفي أول موعد فقط في النموذج)" : "Prescribed schedule (prototype captures first time)"}</option></select></label><div className="form-two"><label>{isAr ? "وقت الجرعة الأولى" : "First dose time"}<input type="time" value={medicationForm.time} onChange={(e) => setMedicationForm({ ...medicationForm, time: e.target.value })} required /></label>{(medicationForm.frequency === "twice" || medicationForm.frequency === "three-times") && <label>{isAr ? "وقت الجرعة الثانية" : "Second dose time"}<input type="time" value={medicationForm.secondTime} onChange={(e) => setMedicationForm({ ...medicationForm, secondTime: e.target.value })} required /></label>}{medicationForm.frequency === "three-times" && <label>{isAr ? "وقت الجرعة الثالثة" : "Third dose time"}<input type="time" value={medicationForm.thirdTime} onChange={(e) => setMedicationForm({ ...medicationForm, thirdTime: e.target.value })} required /></label>}</div><div className="form-two"><label>{isAr ? "تاريخ البداية (اختياري)" : "Start date (optional)"}<input type="date" value={medicationForm.startDate} onChange={(e) => setMedicationForm({ ...medicationForm, startDate: e.target.value })}/></label><label>{isAr ? "تاريخ النهاية (اختياري)" : "End date (optional)"}<input type="date" value={medicationForm.endDate} min={medicationForm.startDate || undefined} onChange={(e) => setMedicationForm({ ...medicationForm, endDate: e.target.value })}/></label></div><div className="message-composer-actions"><button className="outline-button" type="button" onClick={() => { setEditingMedicationId(null); setMedicationForm({ name: "", dose: "", time: "08:00", secondTime: "14:00", thirdTime: "20:00", frequency: "once", startDate: "", endDate: "" }); }}>{isAr ? "مسح / إلغاء التعديل" : "Clear / cancel edit"}</button><button className="primary-button" type="submit">{editingMedicationId ? (isAr ? "حفظ تعديل الدواء" : "Save medication changes") : (isAr ? "إضافة إلى جدول الأدوية" : "Add to medication schedule")}</button></div></form><div className="small-note"><Icon name="shield"/>{isAr ? "النموذج لا يوصي بأدوية أو يغيّر وصفة طبية تلقائيًا." : "The prototype does not prescribe medication or change a prescription automatically."}</div></div></div><div className="panel"><div className="panel-heading"><div><h3>{isAr ? "متابعة الالتزام" : "Adherence follow-up"}</h3><p>{isAr ? "حالة تأكيد الجرعات المبلغ عنها" : "Patient-reported dose confirmation status"}</p></div></div><div className="detail-list"><div><small>{isAr ? "تم تأكيده" : "Confirmed"}</small><strong>{p.medications.filter((m) => m.status === "Taken").length}</strong></div><div><small>{isAr ? "بانتظار التأكيد" : "Awaiting confirmation"}</small><strong>{p.medications.filter((m) => m.status === "Due").length}</strong></div><div><small>{isAr ? "تم تخطيه" : "Skipped"}</small><strong>{p.medications.filter((m) => m.status === "Skipped").length}</strong></div></div><div className="small-note"><Icon name="shield"/>{isAr ? "العلامات الحيوية لا تثبت ابتلاع الدواء. تساعد أمان في المتابعة ولا تتحقق من التناول فعليًا." : "Vitals cannot prove a dose was swallowed. AMAN supports follow-up but cannot verify ingestion."}</div></div></div></>;
+  }
+
+  function renderDoctorCarePlan(p: Patient) {
+    return <><div className="section-banner"><div><div className="section-kicker">AMAN CLINICAL</div><h2>{t("carePlan")}</h2><p>{p.name} · {p.id}</p></div><button className="outline-button" onClick={() => setTab("profile")}>{t("viewProfile")}</button></div><div className="dashboard-columns"><div className="panel"><div className="panel-heading"><div><h3>{isAr ? "تعليمات الرعاية والمتابعة" : "Care instructions & follow-up"}</h3><p>{isAr ? "التعديلات تسجل في سجل التغييرات." : "Changes are recorded in the audit history."}</p></div></div><form className="form-stack" onSubmit={saveCarePlan}><label>{t("instructions")}<textarea rows={6} value={carePlanDraft} onChange={(e) => setCarePlanDraft(e.target.value)} required /></label><label>{isAr ? "موعد المتابعة القادم" : "Next follow-up date"}<input type="date" value={followUpValue} onChange={(e) => setFollowUpValue(e.target.value)} /></label><button className="primary-button" type="submit">{t("save")}</button></form></div><div className="panel"><div className="panel-heading"><div><h3>{isAr ? "ملخص الخطة" : "Plan summary"}</h3><p>{t("band")}</p></div><span className="panel-icon"><Icon name="shield"/></span></div><div className="mini-info-row"><span>{t("bandMode")}</span><strong>{t(p.bandMode)}</strong></div><div className="mini-info-row"><span>{t("bandStatus")}</span><strong>{t(p.bandStatus === "active" ? "bandActive" : p.bandStatus === "returned" ? "bandReturned" : "bandNotIssued")}</strong></div><div className="mini-info-row"><span>{isAr ? "موعد المتابعة" : "Follow-up date"}</span><strong>{p.followUp || (isAr ? "غير محدد" : "Not scheduled")}</strong></div><div className="mini-info-row"><span>{t("medications")}</span><strong>{p.medications.length}</strong></div><button className="text-link" onClick={() => setTab("medication")}>{isAr ? "إدارة الأدوية ←" : "Manage medications →"}</button></div></div><div className="panel"><div className="panel-heading"><div><h3>{isAr ? "سجل التغييرات" : "Audit history"}</h3><p>{isAr ? "سجل من قام بتعديل الخطة أو الأدوية" : "Who changed the care plan or medication schedule"}</p></div></div>{(p.audit || []).map((entry, i) => <div className="timeline-row" key={i}><span className="timeline-dot blue-dot"/><div><p>{entry}</p></div></div>)}</div></>;
+  }
+
+  function renderPatientDashboard() {
+    if (tab === "settings") return renderSettings();
+    if (!activePatient) return <>{renderAccountAccessPanel()}<div className="panel"><h3>{t("noLinkedPatient")}</h3><p>{isAr ? "ملف حسابك موجود في قاعدة البيانات، لكن بيانات الرعاية التفصيلية لم تُنقل بعد إلى التخزين السحابي." : "Your account exists in the database, but detailed care data has not yet been migrated to cloud storage."}</p></div></>;
+    if (tab === "monitoring") return <><div className="section-banner"><div><div className="section-kicker">AMAN PATIENT</div><h2>{t("monitoring")}</h2><p>{t("demoWarning")}</p></div></div>{renderPatientSummary(activePatient)}<div className="panel"><div className="panel-heading"><div><h3>{t("sleep")}</h3><p>{isAr ? "ملخص توضيحي غير متصل بسوار فعلي" : "Illustrative summary, not connected to a physical band"}</p></div></div><div className="sleep-stats"><div><strong>7h 20m</strong><small>{isAr ? "مدة النوم التقديرية" : "Estimated sleep duration"}</small></div><div><strong>3</strong><small>{isAr ? "مرات الاستيقاظ" : "Awakenings"}</small></div><div><strong>{activePatient.vitals.spo2}%</strong><small>SpO₂ · demo</small></div></div></div></>;
+    if (tab === "carePlan") return <div className="panel"><div className="panel-heading"><div><h3>{t("todayPlan")}</h3><p>{t("carePlan")}</p></div><span className="panel-icon"><Icon name="shield"/></span></div><p className="care-instructions">{activePatient.instructions}</p><div className="small-note"><Icon name="shield"/>{t("demoWarning")}</div></div>;
+    if (tab === "medication") return renderMedicationPanel(activePatient, true);
+    if (tab === "messages") return renderMessages(activePatient);
+    if (tab === "alerts") return renderPatientAlerts(activePatient);
+    return <><div className="welcome-banner patient-banner"><div><div className="section-kicker">AMAN PATIENT</div><h2>{t("hello")}, {current?.name.split(" ")[0]}.</h2><p>{t("welcomeDashboard")}</p><span className="patient-id-large">{activePatient.id}</span></div><div className="banner-illustration"><div className="banner-circle"><Icon name="heart"/></div><div className="banner-ring"/></div></div>{renderAccountAccessPanel()}<section className="aman-sos-panel" aria-label={isAr ? "طلب مساعدة طارئ" : "Emergency help"}><div className="aman-sos-copy"><span className="aman-sos-kicker">{isAr ? "للطوارئ" : "EMERGENCY"}</span><h2>{isAr ? "هل تحتاج إلى مساعدة الآن؟" : "Need help right now?"}</h2><p>{isAr ? "اضغط لطلب المساعدة من فريق الرعاية." : "Send an emergency help request to your care team."}</p></div><button className="aman-sos-button" onClick={sendManualEmergency}><span className="aman-sos-icon">SOS</span><strong>{isAr ? "طلب مساعدة" : "GET HELP NOW"}</strong></button></section>{renderPatientSummary(activePatient)}<div className="dashboard-columns"><div className="panel"><div className="panel-heading"><div><h3>{t("symptoms")}</h3><p>{isAr ? "أخبر فريق الرعاية بما تشعر به" : "Tell your care team how you feel"}</p></div><span className="panel-icon"><Icon name="message"/></span></div><form className="form-stack" onSubmit={submitSymptom}><textarea value={symptomText} onChange={(e) => setSymptomText(e.target.value)} placeholder={t("symptomPlaceholder")} rows={3} required/><div className="message-composer-actions"><button className="outline-button" type="button" onClick={() => startVoiceInput("symptom")}>{isAr ? "🎙 تحويل الكلام إلى نص" : "🎙 Dictate symptom"}</button><button className="primary-button" type="submit">{t("sendReport")}</button></div></form>{activePatient.symptoms.slice(0, 2).map((s, i) => <div className="timeline-row" key={i}><span className="timeline-dot"/><div><p>{s.text}</p><small>{s.date}</small></div></div>)}</div>{renderMedicationPanel(activePatient, false)}</div></>;
+  }
+
+  function renderMedicationPanel(p: Patient, interactive: boolean) {
+    return <div className="panel"><div className="panel-heading"><div><h3>{t("medications")}</h3><p>{t("medication")}</p></div><span className="panel-icon"><Icon name="heart"/></span></div>{p.medications.length ? <div className="medication-list">{p.medications.map((m) => <div className="med-row medication-detail" key={m.id}><div className="med-dot"/><div className="med-info"><strong>{m.name}</strong><small>{m.dose} · {m.time}{m.startDate || m.endDate ? ` · ${m.startDate || "…"} – ${m.endDate || "…"}` : ""}</small></div>{interactive ? <div className="med-actions">{m.status === "Taken" ? <span className="status-pill green">{t("taken")} ✓</span> : <><button className="mini-action" onClick={() => updateMedication(p.id, m.id, "Taken")}>{t("markTaken")}</button><button className="mini-action muted-action" onClick={() => updateMedication(p.id, m.id, "Skipped")}>{t("markSkipped")}</button><button className="mini-action muted-action" onClick={() => setNotice(isAr ? "تم تذكيرك بإمكانية إعادة التذكير من التنبيهات." : "Reminder option can be connected to notifications in the next iteration.")}>{isAr ? "ذكّرني لاحقًا" : "Remind later"}</button></>}</div> : current?.role === "doctor" ? <div className="med-actions"><span className={`status-pill ${m.status === "Taken" ? "green" : m.status === "Skipped" ? "red" : "yellow"}`}>{t(m.status.toLowerCase())}</span><button className="mini-action" onClick={() => editMedication(m)}>{t("edit")}</button><button className="mini-action muted-action" onClick={() => deleteMedication(m)}>{t("remove")}</button></div> : <span className={`status-pill ${m.status === "Taken" ? "green" : m.status === "Skipped" ? "red" : "yellow"}`}>{t(m.status.toLowerCase())}</span>}</div>)}</div> : <p className="muted-text">{isAr ? "لا توجد أدوية مضافة في النموذج حتى الآن. أضفها من حساب الطبيب." : "No medications have been added yet. The doctor can add them to the plan."}</p>}<div className="small-note"><Icon name="shield"/>{isAr ? "تأكيد التناول يسجل إفادة المريض فقط، ولا يثبت ابتلاع الدواء." : "Dose confirmation is patient-reported and does not prove medication ingestion."}</div></div>;
+  }
+
+  function renderPatientAlerts(p: Patient) {
+    return <div className="panel"><div className="panel-heading"><div><h3>{t("recentAlerts")}</h3><p>{isAr ? "إشعارات حالة الرعاية" : "Care notifications"}</p></div></div>{p.alerts.length ? p.alerts.map((a, i) => <div className="alert-row" key={i}><span className={`alert-indicator ${a.level}`}/><div className="alert-copy"><p>{a.text}</p><small>{a.date}</small></div></div>) : <p className="muted-text">{isAr ? "لا توجد تنبيهات مسجلة حاليًا." : "No alerts have been recorded."}</p>}<div className="small-note"><Icon name="shield"/>{t("demoWarning")}</div></div>;
+  }
+
+  function renderMessages(p: Patient) {
+    const options = current?.role === "doctor"
+      ? [{ value: "Patient", label: isAr ? "المريض" : "Patient" }, { value: "Authorized family", label: isAr ? "العائلة المصرح لها" : "Authorized family" }]
+      : current?.role === "guardian"
+        ? [{ value: "Care team", label: isAr ? "الطبيب / فريق الرعاية" : "Doctor / care team" }, { value: "Patient", label: isAr ? "المريض" : "Patient" }]
+        : [{ value: "Care team", label: isAr ? "الطبيب / فريق الرعاية" : "Doctor / care team" }, { value: "Family/caregiver", label: isAr ? "العائلة / مقدم الرعاية" : "Family / caregiver" }];
+    const selectedRecipient = options.some((o) => o.value === messageRecipient) ? messageRecipient : options[0].value;
+    const visibleMessages = p.messages.filter((m) => {
+      if (!m.to || m.from === current?.name) return true;
+      if (current?.role === "doctor") return m.to === "Care team" || m.to === "Doctor / care team" || m.to === "Authorized family" || m.to === current.name;
+      if (current?.role === "patient") return m.to === "Patient" || m.to === current.name;
+      return m.to === "Authorized family" || m.to === current?.name || m.to === "Family/caregiver";
+    });
+    return <div className="panel messages-panel"><div className="panel-heading"><div><h3>{t("contactTeam")}</h3><p>{isAr ? "اختاري المستلم قبل إرسال الرسالة" : "Choose a recipient before sending a message"}</p></div><span className="panel-icon"><Icon name="message"/></span></div><label className="recipient-picker">{isAr ? "إرسال إلى" : "Send to"}<select value={selectedRecipient} onChange={(e) => setMessageRecipient(e.target.value)}>{options.map((o) => <option value={o.value} key={o.value}>{o.label}</option>)}</select></label><div className="message-thread">{visibleMessages.length ? visibleMessages.map((m, i) => <div className={`message-bubble ${m.from === current?.name ? "mine" : ""}`} key={i}><div className="message-meta"><strong>{m.from}</strong><small>{m.date}</small></div>{m.to && <small className="message-recipient">{isAr ? "إلى:" : "To:"} {m.to}</small>}<p>{m.text}</p><button className="text-link read-message" type="button" onClick={() => readAloud(m.text)}>{isAr ? "اقرأ الرسالة صوتيًا" : "Read aloud"}</button></div>) : <p className="muted-text">{t("noMessages")}</p>}</div><form className="form-stack message-form" onSubmit={sendMessage}><textarea value={messageText} onChange={(e) => setMessageText(e.target.value)} placeholder={t("messagePlaceholder")} rows={3} required/><div className="message-composer-actions"><button className="outline-button" type="button" onClick={() => startVoiceInput("message")}>{isAr ? "🎙 تسجيل / تحويل الصوت" : "🎙 Dictate message"}</button><button className="primary-button" type="submit">{t("send")} <Icon name={isAr ? "back" : "arrow"}/></button></div></form><div className="small-note"><Icon name="shield"/>{isAr ? "هذه نسخة محلية؛ لن تصل الرسالة للطرف الآخر حتى ربط نظام مراسلة حقيقي. راجعي النص المحوّل من الصوت قبل الإرسال." : "This is a local prototype; messages will not reach another person until a real messaging backend is connected. Review dictated text before sending."}</div></div>;
+  }
+
+  function renderGuardianDashboard() {
+    if (tab === "settings") return renderSettings();
+    if (!activePatient) return <>{renderAccountAccessPanel()}<div className="panel"><h3>{t("noLinkedPatient")}</h3><p>{isAr ? "طلب الربط محفوظ في قاعدة البيانات، لكن معلومات الرعاية التفصيلية ستظهر بعد اعتماد الطلب واستكمال نقل بيانات المريض إلى التخزين السحابي." : "Your link request is stored in the database. Detailed patient-care information will appear after approval and cloud data migration."}</p></div></>;
+    if (tab === "monitoring") return <><div className="section-banner"><div><div className="section-kicker">AMAN FAMILY</div><h2>{t("monitoring")}</h2><p>{t("demoWarning")}</p></div></div>{renderPatientSummary(activePatient)}</>;
+    if (tab === "medication") return renderMedicationPanel(activePatient, false);
+    if (tab === "alerts") return renderPatientAlerts(activePatient);
+    if (tab === "messages") return renderMessages(activePatient);
+    return <><div className="welcome-banner family-banner"><div><div className="section-kicker">AMAN FAMILY</div><h2>{isAr ? `متابعة ${activePatient.name}` : `Looking out for ${activePatient.name}`}</h2><p>{t("guardianSub")}</p><span className="patient-id-large">{activePatient.id}</span></div><div className="banner-illustration"><div className="banner-circle"><Icon name="users"/></div><div className="banner-ring"/></div></div>{renderAccountAccessPanel()}<div className="family-permission"><Icon name="shield"/><div><strong>{isAr ? "وصول الأسرة المصرّح به" : "Authorized family access"}</strong><p>{t("contactPermission")}</p></div></div>{renderPatientSummary(activePatient)}<div className="dashboard-columns">{renderMedicationPanel(activePatient, false)}<div className="panel"><div className="panel-heading"><div><h3>{t("contactTeam")}</h3><p>{isAr ? "أرسل استفسارًا إلى الفريق الطبي" : "Send a message to the care team"}</p></div><span className="panel-icon"><Icon name="message"/></span></div><label className="recipient-picker">{isAr ? "إرسال إلى" : "Send to"}<select value={messageRecipient === "Patient" ? "Patient" : "Care team"} onChange={(e) => setMessageRecipient(e.target.value)}><option value="Care team">{isAr ? "الطبيب / فريق الرعاية" : "Doctor / care team"}</option><option value="Patient">{isAr ? "المريض" : "Patient"}</option></select></label><form className="form-stack" onSubmit={sendMessage}><textarea rows={3} value={messageText} onChange={(e) => setMessageText(e.target.value)} placeholder={t("messagePlaceholder")} required/><div className="message-composer-actions"><button className="outline-button" type="button" onClick={() => startVoiceInput("message")}>{isAr ? "🎙 تحويل الكلام إلى نص" : "🎙 Dictate message"}</button><button className="primary-button" type="submit">{t("send")}</button></div></form><button className="text-link" onClick={() => setTab("messages")}>{isAr ? "عرض سجل التواصل ←" : "View communication history →"}</button></div></div></>;
+  }
+
+  function renderSettings() {
+    return <div className="settings-layout"><div className="section-banner"><div><div className="section-kicker">AMAN CONNECT</div><h2>{t("settings")}</h2><p>{t("updateSettings")}</p></div></div><div className="panel settings-panel"><div className="panel-heading"><div><h3>{isAr ? "الملف الشخصي" : "Profile"}</h3><p>{isAr ? "عدّلي بيانات حسابك وصورتك الشخصية" : "Update your personal details and profile photo"}</p></div></div><div className="profile-photo-editor"><div className="avatar profile-photo-large">{current?.avatarData ? <img src={current.avatarData} alt="Profile"/> : current?.name.split(" ").map((x) => x[0]).slice(0, 2).join("")}</div><div><label className="upload-photo-label">{isAr ? "رفع / تغيير الصورة" : "Upload / change photo"}<input type="file" accept="image/*" onChange={uploadProfilePicture}/></label>{current?.avatarData && <button type="button" className="text-link" onClick={removeProfilePicture}>{isAr ? "حذف الصورة" : "Remove photo"}</button>}<small>{isAr ? "صورة حتى 2 ميجابايت؛ تحفظ محليًا في هذا النموذج." : "Image up to 2 MB; saved locally in this prototype."}</small></div></div><form className="form-stack profile-edit-form" onSubmit={saveProfile}><label>{t("fullName")}<input value={profileDraft.name} onChange={(e) => setProfileDraft({ ...profileDraft, name: e.target.value })} required/></label><label>{t("mobileEmail")}<input value={profileDraft.contact} onChange={(e) => setProfileDraft({ ...profileDraft, contact: e.target.value })} required/></label>{current?.role === "doctor" && <><label>{t("doctorTitle")}<input value={profileDraft.title} onChange={(e) => setProfileDraft({ ...profileDraft, title: e.target.value })}/></label><label>{t("specialty")}<input value={profileDraft.specialty} onChange={(e) => setProfileDraft({ ...profileDraft, specialty: e.target.value })}/></label><label>{isAr ? "الرقم المهني" : "Professional ID"}<input value={profileDraft.professionalId} onChange={(e) => setProfileDraft({ ...profileDraft, professionalId: e.target.value })}/></label></>}<button className="primary-button" type="submit">{t("save")}</button></form><p className="small-note"><Icon name="shield"/>{isAr ? "الحفظ هنا محلي فقط؛ الحسابات عبر الأجهزة تتطلب قاعدة بيانات آمنة." : "Changes are local only; cross-device accounts require a secure database."}</p></div><div className="panel settings-panel"><div className="setting-row"><div className="setting-row-icon"><Icon name="grid"/></div><div className="setting-row-copy"><strong>{t("chooseLanguage")}</strong><p>{isAr ? "اختر لغة الواجهة بالكامل." : "Choose the language used throughout the app."}</p></div><div className="segmented"><button className={lang === "en" ? "selected" : ""} onClick={() => setLang("en")}>English</button><button className={lang === "ar" ? "selected" : ""} onClick={() => setLang("ar")}>العربية</button></div></div><div className="setting-row"><div className="setting-row-icon"><Icon name="sun"/></div><div className="setting-row-copy"><strong>{t("chooseTheme")}</strong><p>{isAr ? "غيّر بين المظهر الفاتح والداكن." : "Switch between light and dark appearance."}</p></div><div className="segmented"><button className={theme === "light" ? "selected" : ""} onClick={() => setTheme("light")}><Icon name="sun"/>{t("light")}</button><button className={theme === "dark" ? "selected" : ""} onClick={() => setTheme("dark")}><Icon name="moon"/>{t("dark")}</button></div></div></div><div className="panel settings-panel"><div className="panel-heading"><div><h3>{isAr ? "النسخ الاحتياطي للبيانات" : "Data backup"}</h3><p>{isAr ? "احفظي نسخة من بيانات AMAN أو استرجعي نسخة سابقة." : "Download a backup of AMAN data or restore a previous backup."}</p></div><span className="panel-icon"><Icon name="shield"/></span></div><div className="setting-row"><div className="setting-row-copy"><strong>{isAr ? "تنزيل نسخة احتياطية" : "Download a backup"}</strong><p>{isAr ? "ملف خاص يحتوي على بيانات الحسابات والمرضى المسجلة محليًا." : "A private file containing accounts and patient data saved in this browser."}</p></div><button className="outline-button" type="button" onClick={exportDataBackup}>{isAr ? "تنزيل النسخة" : "Download backup"}</button></div><div className="setting-row"><div className="setting-row-copy"><strong>{isAr ? "استرجاع نسخة احتياطية" : "Restore a backup"}</strong><p>{isAr ? "استبدال البيانات المحلية بمحتوى ملف AMAN احتياطي." : "Restore local data from an AMAN backup file."}</p></div><button className="outline-button" type="button" onClick={importDataBackup}>{isAr ? "استرجاع" : "Restore backup"}</button></div><p className="small-note"><Icon name="shield"/>{isAr ? "الحفظ التلقائي يعمل داخل هذا المتصفح فقط. مشاركة البيانات بين الأجهزة تتطلب ربط قاعدة بيانات سحابية آمنة. لا تشاركي ملف النسخة الاحتياطية؛ فقد يحتوي على بيانات حساسة." : "Automatic saving works in this browser only. Sharing data across devices requires a secure cloud database. Do not share the backup file; it may contain sensitive information."}</p></div>{current?.role === "doctor" && <div className="panel settings-panel"><div className="panel-heading"><div><h3>{t("doctorProfile")}</h3><p>{isAr ? "البيانات المهنية التي تظهر في واجهة الطبيب" : "Professional details shown in the clinical interface"}</p></div></div><div className="doctor-profile-detail"><div className="avatar large-avatar">{current.name.split(" ").map((x) => x[0]).slice(0, 2).join("")}</div><div><h3>{current.name}</h3><p>{current.title || "Physician"} · {current.specialty || "Specialty not set"}</p><small>{current.contact}</small></div></div><p className="small-note"><Icon name="shield"/>{isAr ? "في هذه النسخة التجريبية لا يتم التحقق من الترخيص المهني أو الهوية الطبية." : "This prototype does not verify medical licensing or professional identity."}</p></div>}<div className="panel settings-panel"><div className="panel-heading"><div><h3>{t("dataPolicy")}</h3><p>{t("dataPolicyBody")}</p></div><span className="panel-icon"><Icon name="shield"/></span></div></div></div>;
+  }
+
+  function renderDoctorNavHeader() {
+    return <><aside className="app-sidebar"><button className="brand sidebar-brand" onClick={() => changeTab("overview")}><div className="brand-mark"><Icon name="heart"/></div><div><strong>AMAN</strong><small>{current?.role === "doctor" ? "Clinical workspace" : current?.role === "guardian" ? "Family connection" : "Patient care"}</small></div></button><div className="side-section-label">{isAr ? "مساحة العمل" : "WORKSPACE"}</div><nav className="side-nav">{sidebarItems.map((item) => <button key={item.key} className={`nav-item ${tab === item.key || (tab === "profile" && item.key === "patients") ? "active" : ""}`} onClick={() => changeTab(item.key)}><Icon name={item.icon}/><span>{item.label}</span>{item.key === "alerts" && activePatient?.alerts.length ? <span className="nav-count">{activePatient.alerts.length}</span> : null}</button>)}</nav><div className="sidebar-care"><div className="sidebar-care-icon"><Icon name="heart"/></div><strong>{isAr ? "الرعاية تبدأ بالاهتمام" : "Care starts with connection"}</strong><p>{isAr ? "أمان يربط المريض والفريق الطبي والأسرة." : "AMAN connects patients, care teams, and families."}</p></div><div className="sidebar-user"><div className="avatar profile-avatar">{current?.avatarData ? <img src={current.avatarData} alt="Profile"/> : current?.name.split(" ").map((x) => x[0]).slice(0, 2).join("")}</div><div className="side-user-copy"><strong>{current?.name}</strong><small>{current?.role === "doctor" ? current.title || "Doctor" : current?.role === "guardian" ? t("guardian") : t("patient")}</small></div><button className="logout-icon" aria-label={t("signOut")} onClick={signOut}><Icon name="logout"/></button></div></aside><div className="app-main"><header className="app-header"><div className="breadcrumbs"><span>AMAN</span><i>/</i><strong>{headerTitle()}</strong></div><div className="app-header-right"><button className="outline-button header-share-button" onClick={sharePreviewLink}><Icon name="share"/>{isAr ? "مشاركة المعاينة" : "Share preview"}</button><button className="outline-button header-share-button" onClick={installApp} disabled={isInstalled}>{isInstalled ? (isAr ? "مثبّت" : "Installed") : (isAr ? "تثبيت التطبيق" : "Install app")}</button>{topControls()}<div className="header-date">{new Date().toLocaleDateString(isAr ? "ar-SA" : "en-US", { month: "short", day: "numeric", year: "numeric" })}</div><div className="header-avatar">{current?.avatarData ? <img src={current.avatarData} alt="Profile"/> : current?.name.slice(0, 1)}</div></div></header><main className="dashboard-content">{previewMode && <div className="preview-mode-banner"><strong>{isAr ? "معاينة عامة" : "Public design preview"}</strong><span>{isAr ? "بيانات اصطناعية فقط؛ لا تستخدمي بيانات مرضى حقيقية." : "Sample data only. Do not enter real patient information."}</span><button className="outline-button" onClick={sharePreviewLink}><Icon name="share"/>{isAr ? "نسخ رابط المعاينة" : "Copy preview link"}</button></div>}{notice && <div className="notice-banner"><span>{notice}</span><button onClick={() => setNotice("")}>×</button></div>}{liveEmergency && current?.role !== "patient" && <section className="aman-emergency-live" role="alert"><div className="aman-emergency-pulse">!</div><div className="aman-emergency-details"><span>AMAN · LIVE EMERGENCY SOS</span><h2>{isAr ? "طلب مساعدة طارئ" : "Emergency help requested"}</h2><p>{liveEmergency.patient_name} · {liveEmergency.patient_code} · {new Date(liveEmergency.created_at).toLocaleString(isAr ? "ar-SA" : "en-US")}</p><small>{liveEmergency.message}</small></div><div className="aman-emergency-actions"><button className="aman-ack-button" onClick={acknowledgeLiveEmergency}>{isAr ? "تأكيد استلام التنبيه" : "ACKNOWLEDGE ALERT"}</button><button className="aman-replay-button" onClick={playEmergencyTone}>{isAr ? "إعادة الصوت" : "Replay sound"}</button></div></section>}{manualEmergency && !manualEmergency.acknowledged && current?.role !== "patient" && <section className="aman-emergency-live" role="alert"><div className="aman-emergency-pulse">!</div><div className="aman-emergency-details"><span>AMAN · EMERGENCY ALERT</span><h2>{isAr ? "طلب مساعدة طارئ" : "Emergency help requested"}</h2><p>{manualEmergency.patientName} · {manualEmergency.patientId} · {manualEmergency.createdAt}</p><small>{isAr ? "بلاغ يدوي تجريبي على هذا الجهاز فقط" : "Manual demo alert on this device only"}</small></div><div className="aman-emergency-actions"><button className="aman-ack-button" onClick={acknowledgeManualEmergency}>{isAr ? "تأكيد الاستلام وإيقاف الصوت" : "ACKNOWLEDGE & STOP SOUND"}</button><button className="aman-replay-button" onClick={playEmergencyTone}>{isAr ? "إعادة الصوت" : "Replay sound"}</button></div></section>}{current?.role === "doctor" ? renderDoctorDashboard() : current?.role === "guardian" ? renderGuardianDashboard() : renderPatientDashboard()}<footer className="dashboard-footer"><span>AMAN BAND · {isAr ? "سلامة المريض خارج جدران المستشفى" : "Patient safety beyond hospital walls"}</span><span>{t("demo")}</span></footer></main></div></>;
+  }
+
+  return <div className={`aman-app theme-${theme}`} dir={isAr ? "rtl" : "ltr"} lang={lang}>
+    <style>{`
+      @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap');
+      *{box-sizing:border-box}html,body{margin:0;min-height:100%;background:#f4f7fb}button,input,textarea,select{font:inherit}button{cursor:pointer}.aman-app{--bg:#f5f7fb;--surface:#fff;--surface-alt:#f7f9fc;--text:#1d2939;--muted:#7b8798;--line:#e6ebf2;--blue:#2766d9;--blue-dark:#194db5;--blue-soft:#eaf1ff;--teal:#21a9a2;--shadow:0 14px 40px rgba(30,52,92,.06);min-height:100vh;background:var(--bg);color:var(--text);font-family:${isAr ? "'IBM Plex Sans Arabic', sans-serif" : "'DM Sans','Manrope',sans-serif"};font-size:14px;transition:background .25s,color .25s}.aman-app.theme-dark{--bg:#101722;--surface:#171f2c;--surface-alt:#1d2736;--text:#ecf2fa;--muted:#9ba9ba;--line:#2b3747;--blue:#6b9cff;--blue-dark:#477fe9;--blue-soft:#263953;--teal:#54d2c7;--shadow:0 14px 40px rgba(0,0,0,.14)}.aman-app button{border:0;color:inherit}.aman-app input,.aman-app textarea,.aman-app select{color:var(--text)}.aman-app input::placeholder,.aman-app textarea::placeholder{color:var(--muted)}.icon{width:19px;height:19px;display:block;flex-shrink:0}.brand{display:flex;align-items:center;gap:11px;color:var(--text);text-align:start;background:transparent;padding:0}.brand-mark{width:42px;height:42px;border-radius:14px;background:linear-gradient(145deg,#2873ed,#164eb9);color:#fff;display:grid;place-items:center;box-shadow:0 7px 15px rgba(39,102,217,.22)}.brand-mark .icon{width:21px;height:21px}.brand>span,.sidebar-brand strong{font:800 19px 'Manrope',sans-serif;letter-spacing:1.4px}.small-brand>span{font-size:21px}.top-controls{display:flex;align-items:center;gap:13px}.setting-control{display:flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--line);padding:4px;border-radius:11px}.setting-control>span{font-size:11px;color:var(--muted);margin:0 7px;white-space:nowrap}.mini-choice,.theme-choice{min-width:31px;height:29px;border-radius:7px;background:transparent;color:var(--muted);font-weight:700;font-size:11px;display:grid;place-items:center}.theme-choice .icon{width:15px;height:15px}.mini-choice.selected,.theme-choice.selected{background:var(--blue-soft);color:var(--blue)}.welcome-screen{position:relative;min-height:100vh;overflow:hidden;padding:30px clamp(22px,6vw,96px) 20px;background:radial-gradient(ellipse at 76% 51%,rgba(61,134,247,.1),transparent 34%),var(--bg);display:flex;flex-direction:column}.welcome-top{display:flex;justify-content:space-between;align-items:center;gap:20px;position:relative;z-index:3}.welcome-main{max-width:1370px;width:100%;margin:auto;display:grid;grid-template-columns:1fr 1fr;align-items:center;gap:5vw;position:relative;min-height:610px}.welcome-content{position:relative;z-index:2;max-width:590px;padding:48px 0}.eyebrow,.section-kicker{font-size:11px;font-weight:800;letter-spacing:2.2px;color:var(--blue);text-transform:uppercase}.eyebrow{display:flex;align-items:center;gap:10px;margin-bottom:21px}.pulse-dot,.signal-dot{width:8px;height:8px;display:inline-block;border-radius:50%;background:var(--teal);box-shadow:0 0 0 5px rgba(33,169,162,.12)}.welcome-wordmark{font:800 clamp(84px,12vw,150px)/.95 'Manrope',sans-serif;letter-spacing:-10px;color:var(--text);margin-left:-7px}.welcome-wordmark span{color:var(--blue)}.tagline{font-size:clamp(20px,2.2vw,28px);font-weight:600;margin-top:24px;letter-spacing:-.6px}.welcome-description{font-size:15px;color:var(--muted);line-height:1.8;max-width:420px;margin:13px 0 30px}.welcome-actions{display:flex;align-items:center;gap:23px}.primary-button,.outline-button,.danger-button,.text-button{display:inline-flex;align-items:center;justify-content:center;gap:10px;border-radius:11px;padding:12px 17px;font-weight:700;font-size:12px;transition:transform .18s,background .18s;white-space:nowrap}.primary-button{background:var(--blue);color:#fff!important;box-shadow:0 7px 15px rgba(39,102,217,.15)}.primary-button:hover{background:var(--blue-dark);transform:translateY(-1px)}.primary-button .icon{width:16px;height:16px}.big-button{padding:16px 22px;border-radius:13px;font-size:13px}.text-button{background:transparent;color:var(--muted)}.welcome-foot{display:flex;flex-wrap:wrap;gap:25px;margin-top:56px;color:var(--muted);font-size:11px}.welcome-foot span{display:flex;align-items:center;gap:7px}.welcome-foot .icon{width:15px;height:15px;color:var(--blue)}.welcome-art{height:490px;min-width:0;position:relative;display:grid;place-items:center}.halo{position:absolute;border:1px solid rgba(39,102,217,.14);border-radius:50%;aspect-ratio:1}.halo-a{width:min(88%,430px);background:radial-gradient(circle,rgba(36,112,235,.11),rgba(36,112,235,.015) 59%,transparent 60%);box-shadow:0 0 70px rgba(39,102,217,.06)}.halo-b{width:min(68%,330px);border-style:dashed;border-color:rgba(39,102,217,.24)}.art-center{width:205px;height:205px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(145deg,#2a73ee,#1652bd);box-shadow:0 35px 85px rgba(36,99,218,.3),inset 0 1px 8px rgba(255,255,255,.35);position:relative;z-index:1;border:9px solid rgba(255,255,255,.28)}.art-heart{width:74px;height:74px;border-radius:24px;background:rgba(255,255,255,.16);display:grid;place-items:center;color:white}.art-heart .icon{width:44px;height:44px;stroke-width:1.3}.art-pulse{position:absolute;bottom:42px;display:flex;gap:4px;align-items:center}.art-pulse span{width:3px;height:9px;border-radius:3px;background:rgba(255,255,255,.85)}.art-pulse span:nth-child(2n){height:16px}.art-pulse span:nth-child(4){height:24px}.art-pulse span:nth-child(6){height:20px}.crosshair{position:absolute;width:10px;height:10px;border:1px solid var(--teal);border-radius:50%;box-shadow:0 0 0 5px rgba(33,169,162,.1)}.x1{top:18%;right:22%}.x2{bottom:19%;left:19%}.floating-tag{position:absolute;z-index:2;background:var(--surface);border:1px solid var(--line);box-shadow:var(--shadow);border-radius:14px;padding:12px 15px;display:flex;align-items:center;gap:11px}.floating-tag b{display:block;font-size:11px}.floating-tag small{display:block;font-size:9px;color:var(--muted);margin-top:4px}.float-icon{width:34px;height:34px;border-radius:10px;background:var(--blue-soft);color:var(--blue);display:grid;place-items:center}.tag-heart{top:20%;left:0}.tag-watch{bottom:22%;right:-1%}.tag-signal{right:5%;top:9%;padding:10px 13px;font-size:10px;color:var(--muted)}.tag-signal .signal-dot{width:7px;height:7px}.welcome-orb{position:absolute;pointer-events:none;border-radius:50%;filter:blur(1px)}.orb-one{background:rgba(63,140,242,.05);width:400px;height:400px;top:-210px;right:2%}.orb-two{background:rgba(46,190,170,.05);width:300px;height:300px;bottom:-180px;left:20%}.welcome-bottom{display:flex;justify-content:space-between;font-size:9px;font-weight:700;letter-spacing:1.2px;color:var(--muted);padding-top:15px;border-top:1px solid var(--line)}.auth-shell{min-height:100vh;display:flex;flex-direction:column;max-width:1500px;margin:0 auto;padding:28px clamp(20px,5vw,72px) 18px}.auth-header{display:flex;align-items:center;justify-content:space-between;gap:20px}.brand-button{cursor:pointer}.role-panel{width:min(720px,100%);margin:auto;padding:55px 0 45px}.back-link{display:inline-flex;align-items:center;gap:8px;background:transparent;color:var(--muted);font-size:12px;font-weight:600;padding:5px 0;margin-bottom:27px}.back-link .icon{width:16px;height:16px}.role-panel h1,.auth-aside h1{font:800 clamp(30px,4vw,43px)/1.18 'Manrope',sans-serif;margin:12px 0 10px;letter-spacing:-1.5px}.section-subtitle{color:var(--muted);margin:0 0 28px}.role-grid{display:grid;gap:12px}.role-card{width:100%;text-align:start;display:flex;align-items:center;gap:17px;background:var(--surface);border:1px solid var(--line)!important;border-radius:16px;padding:19px 21px;transition:border .15s,transform .15s,box-shadow .15s}.role-card:hover{border-color:var(--blue)!important;transform:translateY(-2px);box-shadow:var(--shadow)}.role-icon{width:48px;height:48px;flex-shrink:0;display:grid;place-items:center;border-radius:14px;background:var(--blue-soft);color:var(--blue)}.role-icon .icon{width:23px;height:23px}.role-copy{flex:1}.role-copy h3{font-size:15px;margin:0 0 5px}.role-copy p{font-size:11px;color:var(--muted);margin:0}.role-arrow{width:33px;height:33px;border:1px solid var(--line);border-radius:10px;display:grid;place-items:center;color:var(--muted)}.demo-strip{display:flex;align-items:center;gap:12px;padding:15px 17px;background:var(--blue-soft);border-radius:13px;margin-top:22px}.demo-strip-icon{color:var(--blue)}.demo-strip strong{font-size:11px}.demo-strip p{font-size:10px;color:var(--muted);margin:4px 0 0}.auth-footer{text-align:center;color:var(--muted);font-size:10px;padding-top:15px;border-top:1px solid var(--line)}.auth-layout{display:grid;grid-template-columns:minmax(260px,.8fr) minmax(390px,1.1fr);gap:clamp(25px,6vw,90px);width:min(1020px,100%);margin:auto;padding:48px 0;align-items:center}.auth-aside{background:linear-gradient(145deg,#164eb8,#2875ec);color:white;border-radius:25px;padding:39px 34px;min-height:570px;position:relative;overflow:hidden;display:flex;flex-direction:column;align-items:flex-start;justify-content:center}.auth-aside:after{content:"";position:absolute;width:300px;height:300px;border:1px solid rgba(255,255,255,.16);border-radius:50%;right:-150px;bottom:-80px;box-shadow:0 0 0 38px rgba(255,255,255,.035),0 0 0 78px rgba(255,255,255,.025)}.aside-icon{width:58px;height:58px;background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.23);border-radius:17px;display:grid;place-items:center;margin-bottom:30px}.aside-icon .icon{width:28px;height:28px}.auth-aside .section-kicker{color:#b8d5ff}.auth-aside h1{font-size:36px;color:white}.auth-aside p{color:#dce9ff;line-height:1.7;font-size:13px;max-width:250px}.aside-lines{display:flex;gap:5px;margin-top:21px}.aside-lines span{height:4px;width:33px;border-radius:5px;background:rgba(255,255,255,.26)}.aside-lines span:first-child{background:white;width:54px}.aside-note{display:flex;align-items:center;gap:9px;margin-top:55px;font-size:10px;color:#e6efff;max-width:270px;line-height:1.6}.aside-note .icon{width:17px;height:17px;flex-shrink:0}.auth-card{max-width:510px;width:100%;margin:auto}.auth-card>.back-link{margin-bottom:17px}.auth-tabs{display:flex;gap:23px;border-bottom:1px solid var(--line);margin-bottom:23px}.auth-tabs button{background:transparent;color:var(--muted);font-weight:700;padding:0 0 13px;position:relative;font-size:12px}.auth-tabs button.active{color:var(--blue)}.auth-tabs button.active:after{content:"";height:3px;position:absolute;bottom:-1px;left:0;right:0;background:var(--blue);border-radius:5px}.auth-card h2{font-size:21px;line-height:1.4;letter-spacing:-.5px;margin:0 0 22px}.form-stack{display:flex;flex-direction:column;gap:14px}.form-stack label,.inline-form label{display:flex;flex-direction:column;gap:7px;font-size:11px;font-weight:700;color:var(--text)}.form-stack input,.form-stack select,.form-stack textarea,.inline-form input,.search-box input,.message-composer input{outline:none;border:1px solid var(--line);background:var(--surface);border-radius:9px;padding:12px 12px;width:100%;font-size:12px;min-height:41px;transition:border .18s}.form-stack input:focus,.form-stack select:focus,.form-stack textarea:focus,.inline-form input:focus,.search-box input:focus,.message-composer input:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(39,102,217,.08)}.form-two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field-hint{font-size:10px;color:var(--muted);line-height:1.6;margin:0}.info-message{display:flex;gap:9px;padding:11px 12px;border-radius:10px;background:var(--blue-soft);font-size:10px;color:var(--muted);line-height:1.6}.info-message .icon{color:var(--blue);width:17px;flex-shrink:0}.full-button{width:100%;margin-top:5px;min-height:45px}.error-message{font-size:11px;color:#e44e5f;background:rgba(228,78,95,.09);border-radius:9px;padding:10px 12px}.auth-switch{display:flex;align-items:center;justify-content:center;gap:7px;margin:19px 0;color:var(--muted);font-size:10px}.auth-switch button{background:transparent;color:var(--blue);font-weight:700;font-size:10px}.demo-access{border-top:1px solid var(--line);padding-top:16px;margin-top:10px}.demo-title{font-size:10px;font-weight:800;margin-bottom:10px;color:var(--muted)}.demo-buttons{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.demo-buttons button{font-size:9px;font-weight:700;padding:9px 5px;border:1px solid var(--line);border-radius:8px;background:var(--surface)}.demo-buttons button:hover{background:var(--blue-soft);color:var(--blue)}.demo-access small{display:block;color:var(--muted);font-size:9px;margin-top:9px}.app-sidebar{position:fixed;inset-block:0;inset-inline-start:0;width:244px;background:var(--surface);border-inline-end:1px solid var(--line);padding:26px 17px 17px;display:flex;flex-direction:column;z-index:4}.sidebar-brand{width:100%;margin-bottom:43px}.sidebar-brand .brand-mark{width:39px;height:39px;border-radius:12px}.sidebar-brand strong{display:block;font-size:15px;letter-spacing:1.3px}.sidebar-brand small{display:block;font-size:9px;color:var(--muted);margin-top:3px;font-weight:500}.side-section-label{font-size:9px;letter-spacing:1.6px;color:#99a5b4;font-weight:800;margin:0 0 12px 12px}.side-nav{display:flex;flex-direction:column;gap:5px}.nav-item{display:flex;align-items:center;gap:12px;width:100%;padding:12px 13px;text-align:start;border-radius:10px;background:transparent;color:var(--muted);font-size:11px;font-weight:600;transition:all .18s}.nav-item .icon{width:17px;height:17px}.nav-item:hover{background:var(--surface-alt);color:var(--text)}.nav-item.active{background:var(--blue);color:white;box-shadow:0 7px 15px rgba(39,102,217,.16)}.nav-count{margin-inline-start:auto;min-width:19px;height:19px;border-radius:7px;display:grid;place-items:center;background:rgba(255,255,255,.2);font-size:9px}.sidebar-care{background:var(--surface-alt);border:1px solid var(--line);border-radius:14px;padding:15px;margin-top:auto;margin-bottom:17px}.sidebar-care-icon{color:var(--blue);margin-bottom:12px}.sidebar-care-icon .icon{width:17px;height:17px}.sidebar-care strong{font-size:11px}.sidebar-care p{font-size:10px;color:var(--muted);line-height:1.65;margin:6px 0 0}.sidebar-user{display:flex;align-items:center;gap:9px;border-top:1px solid var(--line);padding-top:17px}.avatar,.header-avatar{flex-shrink:0;border-radius:50%;display:grid;place-items:center;background:linear-gradient(140deg,#cde0ff,#8eb4f8);color:#164eb8;font-size:11px;font-weight:800;width:35px;height:35px}.side-user-copy{min-width:0;flex:1}.side-user-copy strong{display:block;white-space:nowrap;text-overflow:ellipsis;overflow:hidden;font-size:10px}.side-user-copy small{display:block;font-size:9px;color:var(--muted);margin-top:4px;white-space:nowrap;text-overflow:ellipsis;overflow:hidden}.logout-icon{width:28px;height:28px;border-radius:8px;background:transparent;color:var(--muted);display:grid;place-items:center}.logout-icon:hover{background:var(--surface-alt);color:var(--blue)}.logout-icon .icon{width:15px;height:15px}.app-main{margin-inline-start:244px;min-height:100vh}.app-header{height:76px;background:var(--surface);border-bottom:1px solid var(--line);padding:0 clamp(22px,3vw,43px);display:flex;align-items:center;justify-content:space-between;gap:22px;position:sticky;top:0;z-index:3}.breadcrumbs{display:flex;align-items:center;gap:10px;font-size:10px;color:var(--muted)}.breadcrumbs span{color:var(--muted)}.breadcrumbs i{font-style:normal;color:#b4bdc9}.breadcrumbs strong{color:var(--text);font-size:11px}.app-header-right{display:flex;align-items:center;gap:15px}.app-header .top-controls{gap:6px}.app-header .setting-control>span{display:none}.header-date{font-size:10px;color:var(--muted);white-space:nowrap}.header-avatar{width:32px;height:32px;border:2px solid var(--surface)}.dashboard-content{padding:29px clamp(22px,3vw,43px) 20px;max-width:1650px;margin:auto;min-height:calc(100vh - 76px);display:flex;flex-direction:column}.welcome-banner{border-radius:20px;background:linear-gradient(110deg,#eaf2ff 0%,#f3f7ff 54%,#e6f5f7 100%);color:#1c3357;padding:27px 32px;min-height:175px;display:flex;align-items:center;justify-content:space-between;gap:24px;position:relative;overflow:hidden;margin-bottom:22px}.theme-dark .welcome-banner{background:linear-gradient(110deg,#1d3452,#203247 60%,#1b4549);color:#edf5ff}.welcome-banner .section-kicker{color:#2766d9}.theme-dark .welcome-banner .section-kicker{color:#91b7ff}.welcome-banner h2{font:800 clamp(21px,2.5vw,29px)/1.2 'Manrope',sans-serif;letter-spacing:-.8px;margin:10px 0 8px}.welcome-banner p{font-size:11px;color:#64748b;margin:0;max-width:470px}.theme-dark .welcome-banner p{color:#b0c4de}.doctor-credentials{display:flex;align-items:center;gap:9px;margin-top:16px;color:#647ca2;font-size:10px}.doctor-credentials i{display:block;width:4px;height:4px;border-radius:50%;background:#6f8ebd}.banner-illustration{width:130px;height:130px;position:relative;display:grid;place-items:center;flex-shrink:0}.banner-circle{width:75px;height:75px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(145deg,#2a72eb,#2056bd);color:white;box-shadow:0 16px 32px rgba(39,102,217,.24);z-index:1}.banner-circle .icon{width:32px;height:32px;stroke-width:1.3}.banner-ring{position:absolute;width:120px;height:120px;border:1px solid rgba(39,102,217,.18);border-radius:50%;box-shadow:0 0 0 15px rgba(39,102,217,.045)}.patient-id-large{display:inline-block;margin-top:17px;padding:6px 9px;border:1px solid rgba(39,102,217,.18);background:rgba(255,255,255,.4);border-radius:7px;color:#2766d9;font:700 10px 'DM Sans',sans-serif;letter-spacing:.4px}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px;margin-bottom:22px}.metric-card{padding:16px 17px;background:var(--surface);border:1px solid var(--line);border-radius:14px;min-width:0;box-shadow:0 5px 18px rgba(30,52,92,.025)}.metric-icon{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;margin-bottom:15px}.metric-icon .icon{width:17px;height:17px}.metric-icon.blue{background:#e7efff;color:#3273dc}.metric-icon.rose{background:#ffebee;color:#df536b}.metric-icon.amber{background:#fff4dc;color:#c98b21}.metric-icon.green{background:#e2f7ef;color:#23a27f}.theme-dark .metric-icon.blue,.theme-dark .metric-icon.rose,.theme-dark .metric-icon.amber,.theme-dark .metric-icon.green{background:var(--surface-alt);color:var(--blue)}.metric-label{font-size:10px;color:var(--muted);margin-bottom:9px}.metric-value{font:800 28px/1 'Manrope',sans-serif;letter-spacing:-1px;white-space:nowrap}.metric-value span{font:600 10px 'DM Sans',sans-serif;letter-spacing:0;color:var(--muted);margin-inline-start:5px}.metric-foot{display:flex;align-items:center;gap:6px;font-size:9px;color:var(--muted);margin-top:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.metric-status-dot{width:6px;height:6px;border-radius:50%;background:#28b58d;flex-shrink:0}.section-header{display:flex;align-items:center;justify-content:space-between;gap:15px;margin:5px 0 13px}.section-header h3,.panel-heading h3{font-size:13px;margin:0;font-weight:800}.section-header p,.panel-heading p{font-size:10px;color:var(--muted);margin:5px 0 0;line-height:1.5}.outline-button{background:var(--surface);border:1px solid var(--line)!important;color:var(--text);padding:10px 13px;font-size:10px}.outline-button:hover{border-color:var(--blue)!important;color:var(--blue)}.outline-button .icon{width:15px;height:15px}.danger-button{background:rgba(224,66,83,.08);color:#d54555;padding:10px 13px;font-size:10px}.permanent-delete{border:1px solid rgba(224,66,83,.24)!important}.panel{background:var(--surface);border:1px solid var(--line);border-radius:15px;padding:19px;margin-bottom:16px;min-width:0}.panel-heading{display:flex;align-items:center;justify-content:space-between;gap:15px;margin-bottom:16px}.panel-icon{width:33px;height:33px;border-radius:10px;background:var(--blue-soft);color:var(--blue);display:grid;place-items:center;flex-shrink:0}.panel-icon .icon{width:16px;height:16px}.table-panel{padding:0;overflow:hidden}.table-panel>.panel-heading{padding:19px 20px 0}.search-box{display:flex;align-items:center;gap:9px;margin:0 20px 14px;background:var(--surface-alt);border:1px solid var(--line);border-radius:9px;padding:0 11px;max-width:370px;height:37px}.search-box .icon{width:15px;height:15px;color:var(--muted)}.search-box input{border:0!important;background:transparent!important;box-shadow:none!important;padding:0;height:100%;min-height:0;font-size:10px}.table-wrap{overflow-x:auto;width:100%}table{width:100%;border-collapse:collapse;text-align:start;white-space:nowrap}thead{background:var(--surface-alt);border-block:1px solid var(--line)}th{font-size:9px;color:var(--muted);font-weight:700;text-align:start;padding:12px 18px}td{padding:13px 18px;border-bottom:1px solid var(--line);font-size:10px}tbody tr:last-child td{border-bottom:0}.patient-cell{display:flex;align-items:center;gap:10px}.patient-cell strong{display:block;font-size:10px}.patient-cell small{display:block;font-size:9px;color:var(--muted);margin-top:4px;max-width:240px;overflow:hidden;text-overflow:ellipsis}.avatar{width:34px;height:34px;font-size:10px}.id-pill{font:700 9px 'DM Sans',sans-serif;color:var(--blue);background:var(--blue-soft);padding:6px 8px;border-radius:6px}.status-pill{display:inline-flex;align-items:center;border-radius:7px;padding:5px 8px;font-size:9px;font-weight:700;white-space:nowrap}.status-pill.green{color:#218a68;background:#e5f7ef}.status-pill.yellow{color:#ad791d;background:#fff5df}.status-pill.red{color:#cb4053;background:#ffeaee}.status-pill.blue{color:#2a69cd;background:#eaf1ff}.status-pill.gray{color:var(--muted);background:var(--surface-alt)}.theme-dark .status-pill.green,.theme-dark .status-pill.yellow,.theme-dark .status-pill.red,.theme-dark .status-pill.blue{background:var(--surface-alt);color:var(--text)}.row-action{background:transparent;color:var(--blue);font-weight:800;font-size:9px;padding:5px}.row-action:hover{text-decoration:underline}.empty-cell{text-align:center;color:var(--muted);padding:28px}.panel-foot{display:flex;justify-content:space-between;align-items:center;gap:15px;padding:13px 20px;background:var(--surface-alt);border-top:1px solid var(--line);color:var(--muted);font-size:9px}.text-link{background:transparent;color:var(--blue);font-size:10px;font-weight:700;padding:10px 0}.dashboard-footer{display:flex;align-items:center;justify-content:space-between;gap:14px;color:var(--muted);font-size:9px;margin-top:auto;padding-top:25px}.notice-banner{display:flex;align-items:center;justify-content:space-between;gap:10px;border:1px solid rgba(33,169,162,.23);background:rgba(33,169,162,.08);color:var(--text);border-radius:10px;padding:11px 14px;margin-bottom:16px;font-size:11px}.notice-banner button{font-size:18px;color:var(--muted);background:transparent}.section-banner{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-bottom:20px}.section-banner h2{font:800 26px 'Manrope',sans-serif;margin:8px 0 6px;letter-spacing:-.8px}.section-banner p{font-size:11px;color:var(--muted);margin:0;line-height:1.7}.patient-monitor-card{padding:18px}.patient-monitor-card .metric-grid{margin-bottom:0}.patient-monitor-card .dashboard-columns{margin-top:15px}.dashboard-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.dashboard-columns>.panel{margin-bottom:16px}.care-instructions{font-size:12px;line-height:1.8;color:var(--text);padding:13px;background:var(--surface-alt);border-radius:10px;margin:0 0 13px}.mini-info-row{display:flex;justify-content:space-between;gap:15px;padding:11px 0;border-bottom:1px solid var(--line);font-size:10px}.mini-info-row:last-of-type{border-bottom:0}.mini-info-row span{color:var(--muted)}.mini-info-row strong{font-size:10px;text-align:end}.small-note{display:flex;align-items:flex-start;gap:8px;background:var(--surface-alt);border-radius:9px;padding:10px 11px;font-size:9px;color:var(--muted);line-height:1.6;margin-top:14px}.small-note .icon{width:14px;height:14px;color:var(--blue);flex-shrink:0}.medication-list{display:flex;flex-direction:column}.med-row{display:flex;align-items:center;gap:10px;padding:12px 0;border-bottom:1px solid var(--line);min-width:0}.med-row:last-child{border-bottom:0}.med-dot{width:8px;height:8px;border-radius:50%;background:var(--blue);flex-shrink:0;box-shadow:0 0 0 4px var(--blue-soft)}.med-info{flex:1;min-width:0}.med-info strong{display:block;font-size:10px;overflow:hidden;text-overflow:ellipsis}.med-info small{display:block;color:var(--muted);font-size:9px;margin-top:5px}.muted-text{color:var(--muted);font-size:11px;line-height:1.7}.alert-row{display:flex;align-items:center;gap:13px;padding:14px 0;border-bottom:1px solid var(--line)}.alert-row:last-child{border-bottom:0}.alert-indicator{width:9px;height:9px;border-radius:50%;flex-shrink:0;background:#d5a03a;box-shadow:0 0 0 5px rgba(213,160,58,.1)}.alert-indicator.red{background:#e44e5f;box-shadow:0 0 0 5px rgba(228,78,95,.1)}.alert-indicator.green{background:#25aa80;box-shadow:0 0 0 5px rgba(37,170,128,.1)}.alert-copy{flex:1;min-width:0}.alert-copy strong{font-size:11px}.alert-copy p{font-size:10px;line-height:1.5;margin:4px 0;color:var(--text)}.alert-copy small{font-size:9px;color:var(--muted)}.profile-banner{align-items:flex-end}.profile-title-row{display:flex;align-items:center;gap:14px}.profile-title-row h2{margin:0 0 5px}.large-avatar{width:53px;height:53px;font-size:14px}.profile-actions{display:flex;gap:8px;align-items:center}.detail-list{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}.detail-list>div{padding:12px 0;border-bottom:1px solid var(--line);min-width:0}.detail-list small{display:block;color:var(--muted);font-size:9px;margin-bottom:5px}.detail-list strong{font-size:11px;overflow-wrap:anywhere}.panel-actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:17px}.contact-row{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)}.contact-row strong{display:block;font-size:10px}.contact-row small{display:block;color:var(--muted);font-size:9px;margin-top:4px}.small-avatar{width:30px;height:30px;font-size:9px}.inline-form{display:grid;gap:8px;margin-top:14px}.inline-form input{font-size:10px;min-height:36px}.inline-form .outline-button{justify-self:start}.timeline-row{display:flex;align-items:flex-start;gap:10px;padding:12px 0;border-bottom:1px solid var(--line)}.timeline-row:last-child{border-bottom:0}.timeline-dot{width:8px;height:8px;background:var(--teal);border-radius:50%;margin-top:5px;flex-shrink:0;box-shadow:0 0 0 4px rgba(33,169,162,.1)}.blue-dot{background:var(--blue);box-shadow:0 0 0 4px var(--blue-soft)}.timeline-row p{font-size:10px;line-height:1.6;margin:0 0 4px}.timeline-row strong{font-size:10px}.timeline-row small{font-size:9px;color:var(--muted)}.messages-panel{min-height:420px;display:flex;flex-direction:column}.message-thread{display:flex;flex-direction:column;gap:11px;flex:1;max-height:440px;overflow:auto;padding:6px 2px 18px}.message-bubble{max-width:83%;align-self:flex-start;background:var(--surface-alt);border:1px solid var(--line);border-radius:4px 13px 13px;padding:12px 13px}.message-bubble.mine{align-self:flex-end;background:var(--blue-soft);border-color:transparent;border-radius:13px 4px 13px 13px}.message-meta{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.message-meta strong{font-size:9px}.message-meta small{font-size:8px;color:var(--muted)}.message-bubble p{font-size:11px;line-height:1.7;margin:7px 0 0}.message-composer{display:flex;gap:8px;margin-top:15px;padding-top:15px;border-top:1px solid var(--line)}.message-composer input{flex:1;min-width:0}.message-composer .primary-button{padding:10px 13px}.medication-detail{flex-wrap:wrap}.med-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.mini-action{background:var(--blue-soft);color:var(--blue);border-radius:7px;font-size:9px;font-weight:700;padding:7px 8px}.muted-action{background:var(--surface-alt);color:var(--muted)}.sleep-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.sleep-stats>div{padding:16px;background:var(--surface-alt);border-radius:11px}.sleep-stats strong{display:block;font:800 20px 'Manrope',sans-serif}.sleep-stats small{display:block;font-size:9px;color:var(--muted);margin-top:6px;line-height:1.5}.family-permission{display:flex;align-items:flex-start;gap:13px;padding:14px 17px;border-radius:12px;background:var(--blue-soft);margin-bottom:18px;color:var(--blue)}.family-permission>.icon{width:21px;height:21px;flex-shrink:0}.family-permission strong{font-size:11px}.family-permission p{font-size:10px;line-height:1.6;margin:5px 0 0;color:var(--muted)}.settings-layout{max-width:950px}.settings-panel{padding:6px 20px}.setting-row{display:flex;align-items:center;gap:15px;padding:18px 0;border-bottom:1px solid var(--line)}.setting-row:last-child{border-bottom:0}.setting-row-icon{width:39px;height:39px;border-radius:12px;background:var(--blue-soft);color:var(--blue);display:grid;place-items:center;flex-shrink:0}.setting-row-copy{flex:1;min-width:150px}.setting-row-copy strong{font-size:11px}.setting-row-copy p{font-size:10px;color:var(--muted);margin:5px 0 0}.segmented{display:flex;gap:4px;padding:4px;border:1px solid var(--line);background:var(--surface-alt);border-radius:10px}.segmented button{display:flex;align-items:center;gap:6px;background:transparent;border-radius:7px;padding:8px 10px;font-size:9px;color:var(--muted);font-weight:700;white-space:nowrap}.segmented button .icon{width:14px;height:14px}.segmented button.selected{background:var(--surface);color:var(--blue);box-shadow:0 1px 5px rgba(0,0,0,.07)}.doctor-profile-detail{display:flex;align-items:center;gap:14px;padding:5px 0 12px}.doctor-profile-detail h3{font-size:13px;margin:0 0 5px}.doctor-profile-detail p{font-size:10px;color:var(--muted);margin:0 0 5px}.doctor-profile-detail small{font-size:9px;color:var(--muted)}
+      [dir="rtl"] .welcome-wordmark{letter-spacing:-5px;margin-left:0;margin-right:-4px}[dir="rtl"] .side-section-label{text-align:right;margin-right:12px;margin-left:0}[dir="rtl"] .tag-heart{left:auto;right:0}[dir="rtl"] .tag-watch{right:auto;left:-1%}[dir="rtl"] .tag-signal{right:auto;left:5%}[dir="rtl"] .x1{right:auto;left:22%}[dir="rtl"] .x2{left:auto;right:19%}[dir="rtl"] .welcome-bottom{letter-spacing:.4px}[dir="rtl"] .auth-tabs button.active:after{left:0;right:0}[dir="rtl"] .message-bubble.mine{border-radius:4px 13px 13px 13px}[dir="rtl"] .message-bubble:not(.mine){border-radius:13px 4px 13px 13px}[dir="rtl"] .welcome-actions .icon{transform:scaleX(-1)}
+
+      .share-preview-button{display:inline-flex;align-items:center;gap:8px}.password-field{position:relative;display:flex;align-items:center}.password-field input{padding-inline-end:46px!important;width:100%}.password-toggle{position:absolute;inset-inline-end:8px;width:32px;height:32px;border-radius:9px;background:var(--surface-alt);color:var(--muted)!important;display:grid;place-items:center;font-size:18px;z-index:2}.login-options{display:flex;align-items:center;justify-content:space-between;gap:12px}.login-options .field-hint{margin:0}.recovery-panel{width:min(560px,100%);margin:70px auto;padding:28px;background:var(--surface);border:1px solid var(--line);border-radius:20px;box-shadow:var(--shadow)}.recovery-panel h1{font-size:30px;letter-spacing:-.8px;margin:14px 0 8px}.recovery-notice{margin:16px 0}.preview-mode-banner{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:0 0 18px;padding:12px 15px;border:1px solid var(--line);border-radius:12px;background:var(--surface);font-size:12px}.preview-mode-banner span{color:var(--muted);flex:1}.profile-photo-editor{display:flex;align-items:center;gap:18px;margin:12px 0 20px}.profile-photo-large{width:76px;height:76px;font-size:22px}.profile-photo-large img,.profile-avatar img,.header-avatar img{width:100%;height:100%;object-fit:cover;border-radius:inherit}.upload-photo-label{display:inline-flex;flex-direction:column;gap:6px;color:var(--blue);font-weight:700;cursor:pointer}.upload-photo-label input{display:block;max-width:220px;font-size:11px}.profile-photo-editor small{display:block;color:var(--muted);margin-top:7px}.profile-edit-form{max-width:600px}.recipient-picker{display:flex;align-items:center;gap:12px;margin:0 0 14px;color:var(--muted);font-size:12px;font-weight:600}.recipient-picker select{min-width:210px;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--surface-alt)}.message-recipient{color:var(--muted)}.read-message{margin-top:4px}.message-form{margin-top:12px}.message-composer-actions{display:flex;justify-content:space-between;gap:10px;align-items:center}.logout-confirm-card{max-width:480px}.profile-avatar{overflow:hidden}.profile-avatar img{display:block}.notice-banner{overflow-wrap:anywhere}
+      .welcome-notice{max-width:560px;margin:0 0 18px}.welcome-actions{flex-wrap:wrap}.header-share-button{display:inline-flex;align-items:center;gap:7px;white-space:nowrap}.preview-mode-banner .outline-button{display:inline-flex;align-items:center;gap:7px}
+      @media(max-width:1100px){.app-sidebar{width:214px;padding-inline:13px}.app-main{margin-inline-start:214px}.dashboard-content{padding-inline:22px}.welcome-main{gap:1vw}.welcome-art{transform:scale(.92)}.metric-grid{gap:9px}.metric-card{padding:14px}.metric-value{font-size:25px}.app-header{padding-inline:22px}}
+      @media(max-width:820px){.welcome-main{grid-template-columns:1fr;min-height:auto;gap:0;padding:38px 0 20px}.welcome-content{padding:25px 0 0}.welcome-art{height:360px;transform:none;max-width:500px;width:100%;margin:auto}.welcome-wordmark{font-size:clamp(78px,18vw,125px)}.welcome-foot{margin-top:34px}.auth-layout{grid-template-columns:1fr;max-width:560px;gap:24px;padding:32px 0}.auth-aside{min-height:auto;padding:25px;border-radius:19px}.auth-aside .aside-icon{margin-bottom:18px}.auth-aside h1{font-size:28px}.auth-aside p{margin:5px 0}.aside-lines,.aside-note{display:none}.app-sidebar{position:sticky;inset-block:auto;inset-inline:0;width:100%;height:auto;padding:10px 14px;border-inline-end:0;border-bottom:1px solid var(--line);flex-direction:row;align-items:center;gap:12px;overflow-x:auto}.sidebar-brand{margin:0;width:auto;flex-shrink:0}.sidebar-brand small,.side-section-label,.sidebar-care,.sidebar-user{display:none}.sidebar-brand .brand-mark{width:35px;height:35px}.sidebar-brand strong{font-size:12px}.side-nav{flex-direction:row;gap:4px}.nav-item{padding:10px;border-radius:9px;width:auto;flex-shrink:0;gap:7px}.nav-item span:not(.nav-count){display:none}.nav-item .icon{width:18px;height:18px}.nav-count{position:absolute;transform:translate(10px,-10px)}.app-main{margin-inline-start:0}.app-header{height:62px;position:relative;padding-inline:15px}.app-header-right{gap:8px}.app-header .setting-control>span,.header-date{display:none}.app-header .setting-control{padding:3px}.app-header .mini-choice,.app-header .theme-choice{height:26px;min-width:27px}.dashboard-content{padding:18px 15px}.dashboard-columns{grid-template-columns:1fr}.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.welcome-banner{padding:23px;min-height:150px}.banner-illustration{transform:scale(.76);margin-inline:-15px}.welcome-banner h2{font-size:23px}.dashboard-footer{font-size:8px}.patient-monitor-card .metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.role-panel{padding:40px 0}.profile-banner{align-items:flex-start;flex-direction:column}.profile-actions{align-self:stretch}.profile-actions button{flex:1}}
+      @media(max-width:520px){.welcome-screen{padding:20px 18px 15px}.welcome-top{align-items:flex-start}.welcome-top .top-controls{flex-direction:column;align-items:flex-end;gap:5px}.welcome-main{padding-top:28px}.welcome-wordmark{letter-spacing:-6px}.tagline{font-size:21px}.welcome-description{font-size:13px}.welcome-foot{gap:13px;flex-direction:column;margin-top:29px}.welcome-art{height:290px}.art-center{width:155px;height:155px}.art-heart{width:58px;height:58px}.art-heart .icon{width:33px;height:33px}.art-pulse{bottom:28px}.floating-tag{padding:9px 10px}.tag-heart{top:17%;left:0}.tag-watch{bottom:15%;right:0}.tag-signal{top:4%;right:0}.float-icon{width:29px;height:29px}.floating-tag b{font-size:9px}.floating-tag small{font-size:8px}.welcome-bottom{font-size:8px;gap:15px}.auth-shell{padding:18px 16px 15px}.auth-header .top-controls{gap:5px}.auth-header .setting-control>span{display:none}.auth-header .setting-control{padding:3px}.auth-layout{padding:25px 0}.auth-aside{padding:21px}.auth-card h2{font-size:18px}.form-two{grid-template-columns:1fr}.demo-buttons{grid-template-columns:1fr}.role-panel{padding:32px 0}.role-panel h1{font-size:31px}.role-card{padding:14px;gap:12px}.role-icon{width:42px;height:42px}.role-copy h3{font-size:13px}.role-copy p{font-size:10px}.app-sidebar{gap:8px;padding:9px}.sidebar-brand{gap:6px}.sidebar-brand .brand-mark{width:32px;height:32px;border-radius:10px}.sidebar-brand strong{font-size:10px}.side-nav{gap:2px}.nav-item{padding:9px}.nav-item .icon{width:16px;height:16px}.app-header{padding-inline:10px}.breadcrumbs{gap:5px;font-size:9px}.breadcrumbs strong{font-size:10px}.app-header .top-controls{gap:3px}.app-header .setting-control{padding:2px}.app-header .mini-choice,.app-header .theme-choice{min-width:23px;height:24px}.app-header .theme-choice .icon{width:12px;height:12px}.header-avatar{width:26px;height:26px}.dashboard-content{padding:13px 10px}.welcome-banner{padding:19px 16px;min-height:138px;border-radius:15px}.welcome-banner h2{font-size:20px}.welcome-banner p{font-size:10px;max-width:250px}.banner-illustration{width:80px;height:90px;transform:scale(.62);margin-inline:-22px}.doctor-credentials{font-size:9px;flex-wrap:wrap}.metric-grid{gap:8px}.metric-card{padding:12px}.metric-icon{width:29px;height:29px;margin-bottom:11px}.metric-label{font-size:9px}.metric-value{font-size:24px}.metric-foot{font-size:8px}.panel{padding:14px;border-radius:12px}.panel-heading h3{font-size:12px}.section-header h3{font-size:12px}.outline-button{font-size:9px;padding:9px}.search-box{margin-inline:12px;max-width:none}.table-panel>.panel-heading{padding:15px 12px 0}.table-panel th,.table-panel td{padding:11px}.patient-cell{gap:7px}.patient-cell small{max-width:120px}.avatar{width:29px;height:29px;font-size:9px}.id-pill{font-size:8px;padding:5px}.status-pill{font-size:8px;padding:4px 6px}.dashboard-footer{flex-direction:column;align-items:flex-start;gap:6px;padding-top:17px}.section-banner h2{font-size:22px}.section-banner p{font-size:10px}.profile-title-row{gap:10px}.profile-title-row h2{font-size:19px}.large-avatar{width:44px;height:44px}.detail-list{grid-template-columns:1fr 1fr;gap:0 10px}.setting-row{flex-wrap:wrap;gap:10px}.setting-row-copy{min-width:calc(100% - 55px)}.segmented{width:100%}.segmented button{flex:1;justify-content:center}.message-composer{gap:5px}.message-composer .primary-button{padding:9px;font-size:9px}.message-composer .icon{display:none}.sleep-stats{grid-template-columns:1fr}.family-permission{padding:12px}.patient-id-large{font-size:9px}}
+    `}</style>
+    {screen === "welcome" ? renderWelcome() : screen === "role" ? renderRole() : screen === "auth" ? renderAuth() : screen === "recovery" ? renderRecovery() : <div className="app-layout">{renderDoctorNavHeader()}{showAddPatient && <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) setShowAddPatient(false); }}><div className="modal-card"><div className="modal-header"><div><div className="section-kicker">AMAN CLINICAL</div><h2>{t("addPatient")}</h2><p>{isAr ? "اربط ملفًا موجودًا أو أنشئ ملفًا جديدًا." : "Link an existing record or create a new patient file."}</p></div><button className="close-button" onClick={() => setShowAddPatient(false)}>×</button></div><div className="auth-tabs modal-tabs"><button className={patientFormMode === "link" ? "active" : ""} onClick={() => { setPatientFormMode("link"); setFormError(""); }}>{t("linkPatient")}</button><button className={patientFormMode === "new" ? "active" : ""} onClick={() => { setPatientFormMode("new"); setFormError(""); }}>{t("createPatient")}</button></div>{patientFormMode === "link" ? <form className="form-stack" onSubmit={addOrLinkPatient}><label>{t("patientId")}<input value={linkedPatientId} onChange={(e) => setLinkedPatientId(e.target.value)} required placeholder="AMAN-123456"/></label><p className="field-hint">{isAr ? "يجب أن يكون المريض قد سجّل حسابه في أمان وشارك معرّفه معك. سيصل إليه طلب للموافقة." : "The patient must already have an AMAN account and share their Patient ID. They will receive an approval request."}</p>{formError && <div className="error-message">{formError}</div>}<div className="modal-actions"><button className="outline-button" type="button" onClick={() => setShowAddPatient(false)}>{t("cancel")}</button><button className="primary-button" type="submit">{t("linkPatient")}</button></div></form> : <form className="form-stack" onSubmit={addOrLinkPatient}><label>{t("fullName")}<input value={newPatient.name} onChange={(e) => setNewPatient({ ...newPatient, name: e.target.value })} required/></label><div className="form-two"><label>{t("nationalId")}<input value={newPatient.nationalId} onChange={(e) => setNewPatient({ ...newPatient, nationalId: e.target.value })} required/></label><label>{t("birthDate")}<input type="date" value={newPatient.birthDate} onChange={(e) => setNewPatient({ ...newPatient, birthDate: e.target.value })} required/></label></div><label>{t("phone")}<input value={newPatient.phone} onChange={(e) => setNewPatient({ ...newPatient, phone: e.target.value })} required/></label><label>{t("diagnosis")}<input value={newPatient.diagnosis} onChange={(e) => setNewPatient({ ...newPatient, diagnosis: e.target.value })} placeholder={isAr ? "اختياري في النموذج" : "Optional in demo"}/></label><label>{t("bandMode")}<select value={newPatient.bandMode} onChange={(e) => setNewPatient({ ...newPatient, bandMode: e.target.value as "optional" | "prescribed" })}><option value="optional">{t("optional")}</option><option value="prescribed">{t("prescribed")}</option></select></label><label>{t("bandStatus")}<select value={newPatient.bandStatus} onChange={(e) => setNewPatient({ ...newPatient, bandStatus: e.target.value as "active" | "not-issued" })}><option value="active">{t("bandActive")}</option><option value="not-issued">{t("bandNotIssued")}</option></select></label>{formError && <div className="error-message">{formError}</div>}<div className="modal-actions"><button className="outline-button" type="button" onClick={() => setShowAddPatient(false)}>{t("cancel")}</button><button className="primary-button" type="submit">{t("createPatient")}</button></div></form>}</div></div>}{editPatient && <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) setEditPatient(null); }}><div className="modal-card"><div className="modal-header"><div><div className="section-kicker">AMAN CLINICAL</div><h2>{t("edit")} · {editPatient.name}</h2></div><button className="close-button" onClick={() => setEditPatient(null)}>×</button></div><form className="form-stack" onSubmit={savePatientEdits}><label>{t("fullName")}<input value={editPatient.name} onChange={(e) => setEditPatient({ ...editPatient, name: e.target.value })} required/></label><div className="form-two"><label>{t("nationalId")}<input value={editPatient.nationalId} onChange={(e) => setEditPatient({ ...editPatient, nationalId: e.target.value })} required/></label><label>{t("birthDate")}<input type="date" value={editPatient.birthDate} onChange={(e) => setEditPatient({ ...editPatient, birthDate: e.target.value })} required/></label></div><label>{t("phone")}<input value={editPatient.phone} onChange={(e) => setEditPatient({ ...editPatient, phone: e.target.value })} required/></label><label>{t("diagnosis")}<input value={editPatient.diagnosis} onChange={(e) => setEditPatient({ ...editPatient, diagnosis: e.target.value })}/></label><label>{t("instructions")}<textarea rows={3} value={editPatient.instructions} onChange={(e) => setEditPatient({ ...editPatient, instructions: e.target.value })}/></label><div className="form-two"><label>{t("bandMode")}<select value={editPatient.bandMode} onChange={(e) => setEditPatient({ ...editPatient, bandMode: e.target.value as "optional" | "prescribed" })}><option value="optional">{t("optional")}</option><option value="prescribed">{t("prescribed")}</option></select></label><label>{t("careStatus")}<select value={editPatient.status} onChange={(e) => setEditPatient({ ...editPatient, status: e.target.value as PatientStatus })}><option value="active">{t("active")}</option><option value="completed">{t("completed")}</option></select></label></div><div className="modal-actions"><button className="outline-button" type="button" onClick={() => setEditPatient(null)}>{t("cancel")}</button><button className="primary-button" type="submit">{t("save")}</button></div></form></div></div>}<style>{`.app-layout{min-height:100vh}.account-access-panel{margin:0 0 18px}.account-access-form{display:flex;gap:10px;align-items:center;margin:12px 0}.account-access-form input{flex:1;min-width:0}.access-request-list{display:grid;gap:10px;margin-top:12px}.access-request-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px;border:1px solid var(--line);border-radius:12px}.access-request-copy{display:grid;gap:4px;flex:1;min-width:180px}.access-request-copy small{color:var(--muted);font-size:11px}.access-request-actions{display:flex;gap:8px}.account-access-panel .small-note{margin-top:12px}@media(max-width:560px){.account-access-form{flex-direction:column;align-items:stretch}.access-request-row{align-items:flex-start;flex-direction:column}.access-request-actions{width:100%}.access-request-actions button{flex:1}}.aman-sos-panel{display:flex;align-items:center;justify-content:space-between;gap:22px;margin:18px 0;padding:24px;border:1px solid #f0b5bb;border-radius:20px;background:linear-gradient(115deg,#fff1f2,#fff8f8);box-shadow:0 8px 24px rgba(164,26,47,.08)}.aman-sos-kicker{font-size:11px;font-weight:900;letter-spacing:2px;color:#b42335}.aman-sos-copy h2{margin:7px 0;font-size:clamp(20px,3vw,28px);color:#671321}.aman-sos-copy p{margin:0;color:#7b4a50;font-size:14px}.aman-sos-button{min-width:190px;min-height:112px;border:0;border-radius:18px;background:#bd1e35;color:white;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;box-shadow:0 8px 0 #821326,0 14px 24px rgba(189,30,53,.25);cursor:pointer}.aman-sos-button:active{transform:translateY(4px);box-shadow:0 4px 0 #821326}.aman-sos-icon{font-size:31px;font-weight:1000;letter-spacing:2px}.aman-sos-button strong{font-size:13px;letter-spacing:.7px}.aman-emergency-live{position:relative;z-index:5;display:flex;align-items:center;gap:18px;margin:0 0 18px;padding:20px;border:3px solid #b42335;border-radius:18px;background:#fff0f1;box-shadow:0 8px 30px rgba(180,35,53,.18);animation:aman-alert-glow 1.4s ease-in-out infinite alternate}.aman-emergency-pulse{width:54px;height:54px;flex:0 0 54px;border-radius:50%;display:grid;place-items:center;background:#b42335;color:#fff;font-size:32px;font-weight:900}.aman-emergency-details{flex:1}.aman-emergency-details>span{font-size:10px;font-weight:900;letter-spacing:1.5px;color:#b42335}.aman-emergency-details h2{margin:4px 0;color:#7f1728;font-size:22px}.aman-emergency-details p{margin:0 0 4px;color:#56232b;font-weight:700}.aman-emergency-details small{color:#8a5960}.aman-emergency-actions{display:flex;flex-direction:column;gap:8px}.aman-ack-button,.aman-replay-button{border:0;border-radius:10px;padding:12px 16px;font-weight:800;cursor:pointer}.aman-ack-button{background:#9f1930;color:white}.aman-replay-button{background:#fff;color:#9f1930;border:1px solid #d98b95}@keyframes aman-alert-glow{from{box-shadow:0 5px 18px rgba(180,35,53,.12)}to{box-shadow:0 8px 30px rgba(180,35,53,.3)}}@media(max-width:680px){.aman-sos-panel{align-items:stretch;flex-direction:column}.aman-sos-button{width:100%;min-height:100px}.aman-emergency-live{align-items:flex-start;flex-wrap:wrap}.aman-emergency-actions{width:100%}.aman-ack-button,.aman-replay-button{width:100%}}.modal-backdrop{position:fixed;inset:0;background:rgba(11,20,34,.48);z-index:20;display:grid;place-items:center;padding:18px;overflow-y:auto}.modal-card{width:min(580px,100%);max-height:calc(100vh - 36px);overflow:auto;background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:23px;box-shadow:0 25px 70px rgba(0,0,0,.22)}.modal-header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:20px}.modal-header h2{font-size:20px;letter-spacing:-.5px;margin:8px 0 5px}.modal-header p{font-size:10px;color:var(--muted);margin:0}.close-button{width:30px;height:30px;border-radius:9px;background:var(--surface-alt);font-size:22px;line-height:1;color:var(--muted)}.modal-tabs{margin-bottom:20px}.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:8px;padding-top:12px;border-top:1px solid var(--line)}.modal-card .form-stack{padding-bottom:2px}.form-stack label.consent-check{display:flex;flex-direction:row;align-items:flex-start;gap:9px;font-size:10px;font-weight:500;line-height:1.6}.form-stack label.consent-check input[type=checkbox]{width:16px;min-width:16px;min-height:16px;height:16px;margin:1px 0 0;accent-color:var(--blue)}.consent-check span{color:var(--muted)}`}</style></div>}{showLogoutConfirm && <div className="modal-backdrop" role="presentation"><div className="modal-card logout-confirm-card" role="dialog" aria-modal="true" aria-labelledby="logout-confirm-title"><div className="modal-header"><div><div className="section-kicker">AMAN ACCOUNT</div><h2 id="logout-confirm-title">{isAr ? "تأكيد تسجيل الخروج" : "Confirm sign out"}</h2><p>{isAr ? "هل أنتِ متأكدة من تسجيل الخروج؟" : "Are you sure you want to log out?"}</p></div><button className="close-button" onClick={() => setShowLogoutConfirm(false)} aria-label={isAr ? "إغلاق" : "Close"}>×</button></div><div className="modal-actions"><button className="outline-button" onClick={() => setShowLogoutConfirm(false)}>{isAr ? "إلغاء" : "Cancel"}</button><button className="primary-button" onClick={confirmSignOut}>{isAr ? "تأكيد تسجيل الخروج" : "Confirm sign out"}</button></div></div></div>}</div>;
+}
